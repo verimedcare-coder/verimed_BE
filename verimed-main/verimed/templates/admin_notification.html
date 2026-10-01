@@ -1,0 +1,65 @@
+<div style="font-family: system-ui, sans-serif, Arial; font-size: 12px">
+    <div>
+      A message by <b>{{ verimeddepartment.name }}</b> has been received.
+      Kindly respond at your earliest convenience.
+    </div>
+  
+    <div style="margin-top:20px;padding:15px 0;border-width:1px 0;border-style:dashed;border-color:lightgrey;">
+      
+      <table role="presentation">
+        <tr>
+          <td style="vertical-align: top">
+            <div style="padding:6px 10px;margin:0 10px;background-color:aliceblue;border-radius:5px;font-size:26px;">
+              👤
+            </div>
+          </td>
+  
+          <td style="vertical-align: top">
+  
+            <div style="color:#2c3e50;font-size:16px">
+              <strong>{{ verimeddepartment.name }}</strong>
+            </div>
+  
+            <div style="color:#666;font-size:13px">
+              {{ verimeddepartment.email }} |
+              {{ verimeddepartment.phone }}
+            </div>
+  
+            <div style="color:#cccccc;font-size:13px">
+              {{ verimeddepartment.created_at }}
+            </div>
+  
+            <p><strong>Health Concern:</strong> {{ verimeddepartment.health_concern }}</p>
+  
+            <p><strong>Location:</strong>
+              {{ verimeddepartment.city }},
+              {{ verimeddepartment.neighborhood }}
+            </p>
+  
+            <p><strong>Age Range:</strong> {{ verimeddepartment.age_range }}</p>
+  
+            <p><strong>Communication:</strong> {{ verimeddepartment.comm_preference }}</p>
+  
+            <p><strong>Reasons for Screening:</strong> {{ verimeddepartment.health_check }}</p>
+            
+            <p><strong>Gender:</strong> {{ verimeddepartment.gender }}</p>
+
+            <p><strong>Allergies:</strong> {{ verimeddepartment.allergies }}</p>
+
+            <p><strong>Sugar Kidney Test:</strong> {{ verimeddepartment.sugar_kidneytest }}</p>
+                        
+            <p><strong>Diabetes and Blood Pressure Medication:</strong> {{ verimeddepartment.medication_sugar_pressure }}</p>
+            
+            <p><strong>Screening Date:</strong> {{ verimeddepartment.screening_date }}</p>
+
+            <p><strong>Emergency Contact:</strong>
+              {{ verimeddepartment.emergency_con_name }} -
+              {{ verimeddepartment.emergency_phone }}
+            </p>
+  
+          </td>
+        </tr>
+      </table>
+  
+    </div>
+  </div>

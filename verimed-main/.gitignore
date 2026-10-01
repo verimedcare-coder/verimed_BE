@@ -1,0 +1,27 @@
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Django
+*.log
+*.sqlite3
+*.db
+
+# Media files (user uploaded content)
+media/
+verimedproject/media/
+# Environment variables
+.env
+.venv
+venv/
+
+# IDE files
+.vscode/
+.idea/
+
+# Log files
+*.log
+mainapp/logs/
+accounting/logs/
