@@ -33,7 +33,7 @@ ALLOWED_HOSTS = [
     "127.0.0.1",
     "https://verimed.care",
     "https://portal.verimed.care",
-
+    "https://verimed-be.vercel.app",
 ]
 
 # DRF Configuration
@@ -63,6 +63,7 @@ CORS_ALLOWED_ORIGINS = [
     "https://verimed-dashboard.vercel.app",
     "https://verimed.care",
     "https://portal.verimed.care",
+    "https://verimed-be.vercel.app",
 
 
 ]
@@ -75,8 +76,10 @@ CSRF_TRUSTED_ORIGINS = [
     "http://localhost:8000",
     "http://127.0.0.1:8000",
     "https://verimed.care",
-    "https://portal.verimed.care"
+    "https://portal.verimed.care",
+    "https://verimed-be.vercel.app",
 ]
+
 
 
 
