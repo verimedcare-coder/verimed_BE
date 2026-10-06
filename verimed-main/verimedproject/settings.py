@@ -31,9 +31,9 @@ ALLOWED_HOSTS = [
     "verimedramja.pythonanywhere.com",
     "localhost",
     "127.0.0.1",
-    "https://verimed.care",
-    "https://portal.verimed.care",
-    "https://verimed-be.vercel.app",
+    "verimed.care",
+    "portal.verimed.care",
+    ".vercel.app",
 ]
 
 # DRF Configuration
@@ -77,7 +77,7 @@ CSRF_TRUSTED_ORIGINS = [
     "http://127.0.0.1:8000",
     "https://verimed.care",
     "https://portal.verimed.care",
-    "https://verimed-be.vercel.app",
+    "https://*.vercel.app",
 ]
 
 
