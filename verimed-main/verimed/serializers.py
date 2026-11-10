@@ -18,7 +18,7 @@ class UserViewSlr(serializers.ModelSerializer):
 
     class Meta:
         model = User
-        fields = ["id","username","first_name","last_name","email","country_code_id","country_code","phone","user_role","is_active_state","photo_view_url","photo_download_url"]
+        fields = ["id","username","first_name","last_name","email","country_code_id","country_code","phone","user_role","is_active_state","photo_view_url","photo_download_url","service_purchased"]
         
     def get_country_code_id(self, obj):
         return obj.country_code.id if obj.country_code else None

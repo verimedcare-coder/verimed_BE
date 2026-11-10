@@ -5,6 +5,7 @@ from rest_framework.response import Response
 from fieldscontrol.models import FieldsControlErrors
 import json
 from django.db import transaction
+from django.db.models import Q
 from verimed.models import VerimedCountryCode,VerimedDepartment,VerimedBookAppointment,APPOINTMENT_STATUS,SponsorID,PatientID,DoctorID,CaretakerID,AdminID,SponsorProfile,DoctorProfile,CareTakerProfile,PatientProfile,AdminProfile,ROLE_CHOICES,VerimedBookAppointmentLabReports,PatientUploadDocuments,DoctorReports,VerimedDoctorReportsFiles,ContactUs,KetnyproductionCheck
 from fieldscontrol.views import field_validate_not_iterate
 from .serializers import VerimedCountryCodeViewSlr,VerimedDepartmentViewSlr,VerimedBookAppointmentViewSlr,UserViewSlr,SponsorProfileViewSlr,PatientProfileViewSlr,DoctorProfileViewSlr,CareTakerProfileViewSlr,PatientProfileViewSlr,DoctorReportsViewSlr,ContactUsViewSlr,KetnyproductionCheckViewSlr
@@ -12,6 +13,54 @@ from django.contrib.auth.hashers import make_password,check_password
 from django.contrib.sessions.backends.db import SessionStore
 from rest_framework.exceptions import NotFound
 from rest_framework.permissions import AllowAny
+
+
+def get_sponsor_profile(user):
+    if not user or not user.is_authenticated:
+        return None
+    try:
+        return user.sponsor_profile
+    except SponsorProfile.DoesNotExist:
+        return None
+
+
+def is_sponsor_user(user):
+    if not user or not user.is_authenticated or user.is_superuser:
+        return False
+    role = (getattr(user, "user_role", None) or "").strip().lower()
+    if role == "admin":
+        return False
+    try:
+        if user.admin_profile is not None:
+            return False
+    except AdminProfile.DoesNotExist:
+        pass
+    return role == "sponsor" or get_sponsor_profile(user) is not None
+
+
+def resolve_sponsor_profile_by_param(sponsor_val):
+    if sponsor_val is None or str(sponsor_val).strip() == "":
+        return None
+    val_str = str(sponsor_val).strip()
+    if val_str.isdigit():
+        return SponsorProfile.objects.filter(id=int(val_str)).first()
+    return SponsorProfile.objects.filter(
+        Q(sponsor_id=val_str) | Q(user__username=val_str)
+    ).first()
+
+
+def filter_queryset_by_sponsor(queryset, sponsor_profile):
+    return queryset.filter(
+        (
+            Q(sponsor=sponsor_profile)
+            & (
+                Q(patient__isnull=True)
+                | Q(patient__sponsor__isnull=True)
+                | Q(patient__sponsor=sponsor_profile)
+            )
+        )
+        | Q(patient__sponsor=sponsor_profile)
+    ).distinct()
 
 # Create your views here.
 
@@ -1528,6 +1577,22 @@ class VerimedBookAppoinmentCreateUpdate(APIView):
             except PatientProfile.DoesNotExist:
                 return Response({"error": "Invalid patient ID"}, status=status.HTTP_404_NOT_FOUND)
 
+        if is_sponsor_user(request.user):
+            logged_sponsor = get_sponsor_profile(request.user)
+            if logged_sponsor is None:
+                return Response({"error": "Sponsor profile not found"}, status=status.HTTP_403_FORBIDDEN)
+            if spon_obj is not None and spon_obj.id != logged_sponsor.id:
+                return Response(
+                    {"error": "You can only create appointments for your own sponsor account."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            spon_obj = logged_sponsor
+            if patient_obj is not None and patient_obj.sponsor_id != logged_sponsor.id:
+                return Response(
+                    {"error": "You can only book appointments for your own loved ones/patients."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
         # Step 3: Get uploaded files (multiple)
         lab_report_files = request.FILES.getlist("lab_reports")
 
@@ -1665,6 +1730,20 @@ class VerimedBookAppoinmentCreateUpdate(APIView):
         except VerimedBookAppointment.DoesNotExist:
             return Response({"error": "Invalid update_appoinmentid"}, status=status.HTTP_404_NOT_FOUND)
 
+        if is_sponsor_user(request.user):
+            logged_sponsor = get_sponsor_profile(request.user)
+            if logged_sponsor is None:
+                return Response({"error": "Sponsor profile not found"}, status=status.HTTP_403_FORBIDDEN)
+            owns_appointment = (
+                appointmentobj.sponsor_id == logged_sponsor.id
+                or (appointmentobj.patient is not None and appointmentobj.patient.sponsor_id == logged_sponsor.id)
+            )
+            if not owns_appointment:
+                return Response(
+                    {"error": "You do not have permission to update this appointment."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
 
         # Step 2: Validate Foreign Keys
         sponid=report_data.get("sponsor")
@@ -1707,6 +1786,18 @@ class VerimedBookAppoinmentCreateUpdate(APIView):
                 patient_obj = PatientProfile.objects.get(id=patient_id)
             except PatientProfile.DoesNotExist:
                 return Response({"error": "Invalid patient ID"}, status=status.HTTP_404_NOT_FOUND)
+
+        if is_sponsor_user(request.user):
+            if spon_obj is not None and spon_obj.id != logged_sponsor.id:
+                return Response(
+                    {"error": "You cannot assign an appointment to another sponsor."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            if patient_obj is not None and patient_obj.sponsor_id != logged_sponsor.id:
+                return Response(
+                    {"error": "You can only assign your own loved ones/patients."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
 
 
         # Step 4: Handle uploaded files
@@ -1978,8 +2069,34 @@ class VerimedBookAppoinmentCreateUpdate(APIView):
 
     def get(self, request):
         try:
-            # Fetch all appointments
-            appointments_qs = VerimedBookAppointment.objects.all().order_by('-id')
+            appointments_qs = VerimedBookAppointment.objects.all()
+
+            if is_sponsor_user(request.user):
+                sponsor_profile = get_sponsor_profile(request.user)
+                if sponsor_profile is None:
+                    return Response([], status=status.HTTP_200_OK)
+                appointments_qs = filter_queryset_by_sponsor(appointments_qs, sponsor_profile)
+            else:
+                sponsor_param = (
+                    request.query_params.get("sponsor_id")
+                    or request.query_params.get("sponsorid")
+                    or request.query_params.get("sponsor")
+                )
+                if sponsor_param:
+                    sponsor_obj = resolve_sponsor_profile_by_param(sponsor_param)
+                    if sponsor_obj is None:
+                        return Response([], status=status.HTTP_200_OK)
+                    appointments_qs = filter_queryset_by_sponsor(appointments_qs, sponsor_obj)
+
+            patient_param = (
+                request.query_params.get("patient_id")
+                or request.query_params.get("patientid")
+                or request.query_params.get("patient")
+            )
+            if patient_param:
+                appointments_qs = appointments_qs.filter(patient_id=patient_param)
+
+            appointments_qs = appointments_qs.order_by('-id')
             serializer = VerimedBookAppointmentViewSlr(appointments_qs, many=True,context={'request': request})
 
             response_data = []
@@ -2027,12 +2144,27 @@ class VerimedBookAppoinmentCreateUpdate(APIView):
                 {"error": "No Appoinment Deleted IDs provided."},
                 status=status.HTTP_400_BAD_REQUEST
             )
+
+        sponsor_user = is_sponsor_user(request.user)
+        logged_sponsor = get_sponsor_profile(request.user) if sponsor_user else None
+        if sponsor_user and logged_sponsor is None:
+            return Response({"error": "Sponsor profile not found."}, status=status.HTTP_403_FORBIDDEN)
         
         notvalidids = []
         
         for i in appoinmentdeleteids:
             try:
                 appointmentdeleteobj=VerimedBookAppointment.objects.get(id=i)
+                if sponsor_user:
+                    owns_appointment = (
+                        appointmentdeleteobj.sponsor_id == logged_sponsor.id
+                        or (appointmentdeleteobj.patient is not None and appointmentdeleteobj.patient.sponsor_id == logged_sponsor.id)
+                    )
+                    if not owns_appointment:
+                        return Response(
+                            {"error": "You do not have permission to delete another sponsor's appointment."},
+                            status=status.HTTP_403_FORBIDDEN
+                        )
             except VerimedBookAppointment.DoesNotExist:
                 notvalidids.append(i)
 
@@ -2080,9 +2212,37 @@ class VB_PatientAppoinment_List(APIView):
     
     def post(self,request):
         patientprofileid=request.data.get("patientprofileid")
+        sponsorid = request.data.get("sponsorid") or request.data.get("sponsor_id")
         try:
-                # Fetch all appointments
-                appointments_qs = VerimedBookAppointment.objects.filter(patient_id=patientprofileid).order_by('-id')                
+                if is_sponsor_user(request.user):
+                    sponsor_profile = get_sponsor_profile(request.user)
+                    if sponsor_profile is None:
+                        return Response([], status=status.HTTP_200_OK)
+                    appointments_qs = filter_queryset_by_sponsor(
+                        VerimedBookAppointment.objects.all(), sponsor_profile
+                    )
+                    if patientprofileid:
+                        appointments_qs = appointments_qs.filter(patient_id=patientprofileid)
+                    appointments_qs = appointments_qs.order_by('-id')
+                else:
+                    if patientprofileid:
+                        appointments_qs = VerimedBookAppointment.objects.filter(patient_id=patientprofileid)
+                        if sponsorid:
+                            sponsor_obj = resolve_sponsor_profile_by_param(sponsorid)
+                            if sponsor_obj is None:
+                                return Response([], status=status.HTTP_200_OK)
+                            appointments_qs = filter_queryset_by_sponsor(appointments_qs, sponsor_obj)
+                        appointments_qs = appointments_qs.order_by('-id')
+                    elif sponsorid:
+                        sponsor_obj = resolve_sponsor_profile_by_param(sponsorid)
+                        if sponsor_obj is None:
+                            return Response([], status=status.HTTP_200_OK)
+                        appointments_qs = filter_queryset_by_sponsor(
+                            VerimedBookAppointment.objects.all(), sponsor_obj
+                        ).order_by('-id')
+                    else:
+                        appointments_qs = VerimedBookAppointment.objects.none()
+
                 serializer = VerimedBookAppointmentViewSlr(appointments_qs, many=True,context={'request': request})
 
                 response_data = []
@@ -2126,8 +2286,13 @@ class VB_DoctorAppoinment_List(APIView):
     def post(self,request):
         doctorprofileid=request.data.get("doctorprofileid")
         try:
-                # Fetch all appointments
-                appointments_qs = VerimedBookAppointment.objects.filter(doc_id=doctorprofileid).order_by('-id')                
+                appointments_qs = VerimedBookAppointment.objects.filter(doc_id=doctorprofileid)
+                if is_sponsor_user(request.user):
+                    sponsor_profile = get_sponsor_profile(request.user)
+                    if sponsor_profile is None:
+                        return Response([], status=status.HTTP_200_OK)
+                    appointments_qs = filter_queryset_by_sponsor(appointments_qs, sponsor_profile)
+                appointments_qs = appointments_qs.order_by('-id')                
                 serializer = VerimedBookAppointmentViewSlr(appointments_qs, many=True,context={'request': request})
 
                 response_data = []
@@ -2159,6 +2324,84 @@ class VB_DoctorAppoinment_List(APIView):
                     response_data.append(item_with_docs)
 
                 return Response(response_data, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class VB_SponsorAppoinment_List(APIView):
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        sponsorid = (
+            request.data.get("sponsorprofileid")
+            or request.data.get("sponsorid")
+            or request.data.get("sponsor_id")
+        )
+        patientprofileid = request.data.get("patientprofileid") or request.data.get("patient_id")
+        try:
+            if is_sponsor_user(request.user):
+                sponsor_obj = get_sponsor_profile(request.user)
+                if sponsor_obj is None:
+                    return Response([], status=status.HTTP_200_OK)
+                if sponsorid:
+                    requested_sponsor = resolve_sponsor_profile_by_param(sponsorid)
+                    if requested_sponsor is None or requested_sponsor.id != sponsor_obj.id:
+                        return Response(
+                            {"error": "You do not have permission to view another sponsor's appointments."},
+                            status=status.HTTP_403_FORBIDDEN
+                        )
+            else:
+                if not sponsorid:
+                    return Response(
+                        {"error": "sponsorid is required"},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+                sponsor_obj = resolve_sponsor_profile_by_param(sponsorid)
+                if sponsor_obj is None:
+                    return Response(
+                        {"error": "Please provide a valid sponsor ID."},
+                        status=status.HTTP_404_NOT_FOUND
+                    )
+
+            appointments_qs = filter_queryset_by_sponsor(
+                VerimedBookAppointment.objects.all(), sponsor_obj
+            )
+            if patientprofileid:
+                appointments_qs = appointments_qs.filter(patient_id=patientprofileid)
+            appointments_qs = appointments_qs.order_by('-id')
+
+            serializer = VerimedBookAppointmentViewSlr(
+                appointments_qs, many=True, context={'request': request}
+            )
+
+            response_data = []
+
+            for item in serializer.data:
+                appointment_id = item["id"]
+                patient_id = item["patient"]["id"] if item.get("patient") else None
+
+                lab_reports_qs = VerimedBookAppointmentLabReports.objects.filter(
+                    appointment_id=appointment_id,
+                    patient_id=patient_id
+                )
+
+                documents = []
+                for report in lab_reports_qs:
+                    documents.append({
+                        "id": report.id,
+                        "filename": report.file.name if report.file else None,
+                        "uploaded_at": report.uploaded_at,
+                        "view_link": request.build_absolute_uri(report.file.url) if report.file else None,
+                        "download_link": request.build_absolute_uri(report.file.url) if report.file else None
+                    })
+
+                item_with_docs = dict(item)
+                item_with_docs["documents"] = documents
+                response_data.append(item_with_docs)
+
+            return Response(response_data, status=status.HTTP_200_OK)
 
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -2984,7 +3227,24 @@ class PatientProfileList(APIView):
 
     def get(self,request):
         try:
-            verimed_doctor_qs = PatientProfile.objects.all()
+            if is_sponsor_user(request.user):
+                sponsor_profile = get_sponsor_profile(request.user)
+                if sponsor_profile is None:
+                    return Response([], status=status.HTTP_200_OK)
+                verimed_doctor_qs = PatientProfile.objects.filter(sponsor=sponsor_profile)
+            else:
+                sponsor_param = (
+                    request.query_params.get("sponsor_id")
+                    or request.query_params.get("sponsorid")
+                    or request.query_params.get("sponsor")
+                )
+                if sponsor_param:
+                    sponsor_obj = resolve_sponsor_profile_by_param(sponsor_param)
+                    if sponsor_obj is None:
+                        return Response([], status=status.HTTP_200_OK)
+                    verimed_doctor_qs = PatientProfile.objects.filter(sponsor=sponsor_obj)
+                else:
+                    verimed_doctor_qs = PatientProfile.objects.all()
             serializer = PatientProfileViewSlr(verimed_doctor_qs, many=True)
             
             response_data = []
@@ -3030,11 +3290,21 @@ class PatientProfileList(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
+        sponsor_user = is_sponsor_user(request.user)
+        logged_sponsor = get_sponsor_profile(request.user) if sponsor_user else None
+        if sponsor_user and logged_sponsor is None:
+            return Response({"error": "Sponsor profile not found."}, status=status.HTTP_403_FORBIDDEN)
+
         notvalidids = []
         
         for i in patientprofiledeleteids:
             try:
                 patiend_deleteobj=PatientProfile.objects.get(id=i)
+                if sponsor_user and patiend_deleteobj.sponsor_id != logged_sponsor.id:
+                    return Response(
+                        {"error": "You do not have permission to delete another sponsor's patient."},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
             except PatientProfile.DoesNotExist:
                 notvalidids.append(i)
 
@@ -3080,14 +3350,25 @@ class SponsoridPatientProfileList(APIView):
     authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated]
     def post(self,request):
-        sponsorid = request.data.get("sponsorid")
-        try:
-            sponsor = SponsorProfile.objects.get(id=sponsorid)
-        except SponsorProfile.DoesNotExist:
-            return Response(
-                {"error": "Please provide a valid sponsor ID."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        sponsorid = request.data.get("sponsorid") or request.data.get("sponsor_id")
+        if is_sponsor_user(request.user):
+            sponsor = get_sponsor_profile(request.user)
+            if sponsor is None:
+                return Response([], status=status.HTTP_200_OK)
+            if sponsorid:
+                requested_sponsor = resolve_sponsor_profile_by_param(sponsorid)
+                if requested_sponsor is None or requested_sponsor.id != sponsor.id:
+                    return Response(
+                        {"error": "You do not have permission to view another sponsor's patients."},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+        else:
+            sponsor = resolve_sponsor_profile_by_param(sponsorid)
+            if sponsor is None:
+                return Response(
+                    {"error": "Please provide a valid sponsor ID."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
             
         try:
             
@@ -3128,14 +3409,25 @@ class SponsoridPatientProfileDelete(APIView):
     authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated]
     def delete(self,request):
-        sponsorid = request.data.get("sponsorid")
-        try:
-            sponsor = SponsorProfile.objects.get(id=sponsorid)
-        except SponsorProfile.DoesNotExist:
-            return Response(
-                {"error": "Please provide a valid sponsor ID."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        sponsorid = request.data.get("sponsorid") or request.data.get("sponsor_id")
+        if is_sponsor_user(request.user):
+            sponsor = get_sponsor_profile(request.user)
+            if sponsor is None:
+                return Response({"error": "Sponsor profile not found."}, status=status.HTTP_403_FORBIDDEN)
+            if sponsorid:
+                requested_sponsor = resolve_sponsor_profile_by_param(sponsorid)
+                if requested_sponsor is None or requested_sponsor.id != sponsor.id:
+                    return Response(
+                        {"error": "You do not have permission to delete another sponsor's patients."},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+        else:
+            sponsor = resolve_sponsor_profile_by_param(sponsorid)
+            if sponsor is None:
+                return Response(
+                    {"error": "Please provide a valid sponsor ID."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
             
         # Get list of IDs from request data
         if hasattr(request.data, "getlist"):
@@ -3771,6 +4063,23 @@ class DoctorReportsCRUD(APIView):
     def get(self,request):
         try:
             verimed_doctor_qs = DoctorReports.objects.all()
+            if is_sponsor_user(request.user):
+                sponsor_profile = get_sponsor_profile(request.user)
+                if sponsor_profile is None:
+                    return Response([], status=status.HTTP_200_OK)
+                verimed_doctor_qs = filter_queryset_by_sponsor(verimed_doctor_qs, sponsor_profile)
+            else:
+                sponsor_param = (
+                    request.query_params.get("sponsor_id")
+                    or request.query_params.get("sponsorid")
+                    or request.query_params.get("sponsor")
+                )
+                if sponsor_param:
+                    sponsor_obj = resolve_sponsor_profile_by_param(sponsor_param)
+                    if sponsor_obj is None:
+                        return Response([], status=status.HTTP_200_OK)
+                    verimed_doctor_qs = filter_queryset_by_sponsor(verimed_doctor_qs, sponsor_obj)
+
             serializer = DoctorReportsViewSlr(verimed_doctor_qs, many=True,context={"request": request})
             
             response_data = []

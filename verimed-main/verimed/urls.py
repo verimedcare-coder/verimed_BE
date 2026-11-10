@@ -1,7 +1,7 @@
 from django.urls import path
 # from .views import*
 from . import views
-from .views import VerimedCountrycode,VerimedDepartmentCreateUpdate,VerimedBookAppoinmentCreateUpdate,AppoinmentStatusChoices,VB_PatientAppoinment_List,VB_DoctorAppoinment_List,UserCreate,UserUpdate,UserDelete,UserLogin,UserLogout,SponsorProfileList,PatientProfileList,DoctorProfileList,CareTakerProfileList,UserChoices,UserSignup,UserEmailVerify,UserView,DoctorProfileUpdate,PatientProfileCreateUpdate,SponsorProfileUpdate,CaretakerProfileUpdate,DoctorReportsCRUD,SponsoridPatientProfileList,ContactUsC,ContactUsRD,SponsoridPatientProfileDelete,KetnyproductionCheckC,KetnyproductionCheckRD,UserUpdateUser
+from .views import VerimedCountrycode,VerimedDepartmentCreateUpdate,VerimedBookAppoinmentCreateUpdate,AppoinmentStatusChoices,VB_PatientAppoinment_List,VB_DoctorAppoinment_List,VB_SponsorAppoinment_List,UserCreate,UserUpdate,UserDelete,UserLogin,UserLogout,SponsorProfileList,PatientProfileList,DoctorProfileList,CareTakerProfileList,UserChoices,UserSignup,UserEmailVerify,UserView,DoctorProfileUpdate,PatientProfileCreateUpdate,SponsorProfileUpdate,CaretakerProfileUpdate,DoctorReportsCRUD,SponsoridPatientProfileList,ContactUsC,ContactUsRD,SponsoridPatientProfileDelete,KetnyproductionCheckC,KetnyproductionCheckRD,UserUpdateUser
 
 urlpatterns = [
     path('verimed_countrycode/', VerimedCountrycode.as_view(), name='verimed_department_create'),
@@ -13,6 +13,7 @@ urlpatterns = [
     path('verimed_bookappoinment_create_update/',VerimedBookAppoinmentCreateUpdate.as_view(),name='VerimedBookAppoinment'),
     path('vb_patientappoinment_list/',VB_PatientAppoinment_List.as_view()),
     path('vb_doctorappoinment_list/',VB_DoctorAppoinment_List.as_view()),
+    path('vb_sponsorappoinment_list/',VB_SponsorAppoinment_List.as_view()),
 
     
     
