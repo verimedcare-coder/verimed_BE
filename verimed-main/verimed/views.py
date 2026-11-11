@@ -530,10 +530,14 @@ class UserCreate(APIView):
         
         try:
             with transaction.atomic():
-                url = "https://verimed-dashboard.vercel.app/"
                 # files sending
                 from django.core.mail import EmailMessage
                 from django.conf import settings
+                url = getattr(
+                    settings,
+                    "FRONTEND_DASHBOARD_URL",
+                    "https://verimed-fe.vercel.app/",
+                )
 
                 def send_api_verticalcontact_mail(firstname,name, password, email):
                     # subject = "Welcome to VeriMED — Thank You for Registering Your Loved One"
@@ -1143,11 +1147,14 @@ class UserUpdateUser(APIView):
                     
 
                 user.save()
-                
-                url = "https://verimed-dashboard.vercel.app/"
 
                 from django.core.mail import EmailMessage
                 from django.conf import settings
+                url = getattr(
+                    settings,
+                    "FRONTEND_DASHBOARD_URL",
+                    "https://verimed-fe.vercel.app/",
+                )
                 
                 if password:
                     def send_api_verticalcontact_mail():
@@ -1623,7 +1630,11 @@ class VerimedBookAppoinmentCreateUpdate(APIView):
                     appointment_status=report_data.get("appointment_status", "Pending"),
                     preferred_dates=report_data.get("preferred_dates"),
                     preferred_times=report_data.get("preferred_times"),
-                    service_purchased=report_data.get("service_purchased")
+                    service_purchased=(
+                        False
+                        if report_data.get("service_purchased") is None
+                        else report_data.get("service_purchased")
+                    ),
                     
                 )
 
@@ -1636,16 +1647,31 @@ class VerimedBookAppoinmentCreateUpdate(APIView):
                             patient=patient_obj,
                             referid=appointment.id
                         )
-                from django.core.mail import EmailMessage
-                from django.conf import settings
-                 # ✅ Add three recipient emails
-                sponsoremail = spon_obj.user.email
-                sponsorname = spon_obj.user.first_name
-                    
-                def send_api_verticalcontact_mail(sponsorname,sponsoremail):
-                    subject = "Thank You — Your Appointment Request Is Being Processed"                    
-                    message = f"""
-                    <p>Hello <strong>{sponsorname}</strong>,</p>
+
+            from html import escape as html_escape
+            from django.core.mail import EmailMessage
+            from django.conf import settings
+
+            effective_sponsor = (
+                appointment.sponsor
+                or spon_obj
+                or getattr(appointment.patient, "sponsor", None)
+            )
+            sponsor_user = getattr(effective_sponsor, "user", None)
+            sponsoremail = (getattr(sponsor_user, "email", None) or "").strip()
+            sponsorname = (
+                (getattr(sponsor_user, "first_name", None) or "").strip()
+                or (getattr(sponsor_user, "username", None) or "").strip()
+                or "Valued Family Member"
+            )
+
+            def send_api_verticalcontact_mail(sponsorname, sponsoremail):
+                if not sponsoremail:
+                    return False, "Sponsor email address is missing."
+
+                subject = "Thank You — Your Appointment Request Is Being Processed"
+                message = f"""
+                    <p>Hello <strong>{html_escape(sponsorname)}</strong>,</p>
 
                     <p>
                         Thank you for scheduling with VeriMED, the trusted in-home and virtual care
@@ -1671,30 +1697,32 @@ class VerimedBookAppoinmentCreateUpdate(APIView):
                     </p>
 
                     <p>www.Verimed.care ~~~ Serving Families Worldwide</p>
-                    """   
-                    
-                    from_email = settings.DEFAULT_FROM_EMAIL
-                    recipient_list = [sponsoremail]
+                    """
 
-                    
-                    try:
-                        email_msg = EmailMessage(subject, "", from_email, recipient_list)
-                        email_msg.content_subtype = "html"  # VERY IMPORTANT
-                        email_msg.body = message
-                        email_msg.send(fail_silently=False)
-                        print("Vertical contact email sent successfully")
-                        return True
-                    except Exception as e:
-                        print(f"Appoinment Booking Post sending vertical contact email: {e}")
-                        return False
-                    
-                send_api_verticalcontact_mail(sponsorname,sponsoremail)
-                
+                from_email = settings.DEFAULT_FROM_EMAIL
+                recipient_list = [sponsoremail]
 
-                return Response(
-                    {"message": "Patient appointment booked successfully"},
-                    status=status.HTTP_200_OK
-                )
+                try:
+                    email_msg = EmailMessage(subject, "", from_email, recipient_list)
+                    email_msg.content_subtype = "html"  # VERY IMPORTANT
+                    email_msg.body = message
+                    email_msg.send(fail_silently=False)
+                    print("Vertical contact email sent successfully")
+                    return True, None
+                except Exception as e:
+                    print(f"Appoinment Booking Post sending vertical contact email: {e}")
+                    return False, str(e)
+
+            email_sent, email_error = send_api_verticalcontact_mail(sponsorname, sponsoremail)
+
+            return Response(
+                {
+                    "message": "Patient appointment booked successfully",
+                    "email_sent": email_sent,
+                    **({"email_error": email_error} if email_error else {}),
+                },
+                status=status.HTTP_200_OK
+            )
 
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -1802,7 +1830,16 @@ class VerimedBookAppoinmentCreateUpdate(APIView):
 
         # Step 4: Handle uploaded files
         lab_report_files = list(request.FILES.getlist("lab_reports"))
-        lab_report_ids = list(request.data.getlist("lab_report_ids"))
+        if hasattr(request.data, "getlist"):
+            lab_report_ids = list(request.data.getlist("lab_report_ids"))
+        else:
+            raw_ids = request.data.get("lab_report_ids")
+            if raw_ids in (None, ""):
+                lab_report_ids = []
+            elif isinstance(raw_ids, (list, tuple)):
+                lab_report_ids = list(raw_ids)
+            else:
+                lab_report_ids = [raw_ids]
         print("lab_report_files",lab_report_files)
         print("lab_report_ids",lab_report_ids)
         print(len(lab_report_files))
@@ -1811,15 +1848,16 @@ class VerimedBookAppoinmentCreateUpdate(APIView):
         if lab_report_files or lab_report_ids:
             # --- Normalize lab_report_ids ---
             # Handle case where input is like ['1,2,null']
-            if len(lab_report_ids) == 1 and "," in lab_report_ids[0]:
+            if len(lab_report_ids) == 1 and isinstance(lab_report_ids[0], str) and "," in lab_report_ids[0]:
                 lab_report_ids = lab_report_ids[0].split(",")
 
             # Clean up invalid or placeholder values
             cleaned_ids = []
             for val in lab_report_ids:
-                if val and val.lower() not in ["null", "none", ""]:
+                val_str = str(val).strip() if val is not None else ""
+                if val_str and val_str.lower() not in ["null", "none", ""]:
                     try:
-                        cleaned_ids.append(int(val))
+                        cleaned_ids.append(int(val_str))
                     except ValueError:
                         cleaned_ids.append(None)
                 else:
@@ -1909,161 +1947,152 @@ class VerimedBookAppoinmentCreateUpdate(APIView):
                                 referid=appointmentobj.id
                             )
                 
-                # Fetch all lab reports for this appointment & patient
-                lab_reports_qs = VerimedBookAppointmentLabReports.objects.filter(
-                    appointment_id=appointmentobj.id,
-                    patient_id=patient_obj.id
+                effective_patient = patient_obj or appointmentobj.patient
+                effective_sponsor = (
+                    spon_obj
+                    or appointmentobj.sponsor
+                    or getattr(effective_patient, "sponsor", None)
                 )
-                print("lab_reports_qs",lab_reports_qs)
-                
+                effective_dep = dep_obj or appointmentobj.dep
+                effective_doc = doc_obj or appointmentobj.doc
+                effective_caretaker = caretaker_obj or appointmentobj.caretaker
+
+                # Fetch all lab reports for this appointment & patient
+                if effective_patient is not None:
+                    lab_reports_qs = VerimedBookAppointmentLabReports.objects.filter(
+                        appointment_id=appointmentobj.id,
+                        patient_id=effective_patient.id
+                    )
+                else:
+                    lab_reports_qs = VerimedBookAppointmentLabReports.objects.filter(
+                        appointment_id=appointmentobj.id
+                    )
+                print("lab_reports_qs", lab_reports_qs)
+
                 # Build document list
                 documents = []
                 if lab_reports_qs:
-                    for report in lab_reports_qs: 
+                    for report in lab_reports_qs:
                         documents.append({
                             # "id": report.id,
                             # "name": report.file.name if report.file else None,
                             # "uploaded_at": report.uploaded_at,
                             # "view_link": request.build_absolute_uri(report.file.url) if report.file else None,
                             "download_link": request.build_absolute_uri(report.file.url) if report.file else None
-                        })      
-                       
-                sponsorname=spon_obj.user.first_name if spon_obj and spon_obj.user else None
-                departmentname=dep_obj.dep_name if dep_obj and dep_obj else None
-                doctorname=doc_obj.user.first_name if doc_obj and doc_obj.user else None
-                patientname=patient_obj.patient_name if patient_obj and patient_obj else None
-                caretakername = caretaker_obj.user.first_name if caretaker_obj and caretaker_obj.user else None
-                date=appointmentobj.appointment_date
-                time=appointmentobj.appointment_time
-                print("sponsorname",sponsorname)
-                
-                print("jjjjj")
-                
-                from django.core.mail import EmailMessage
-                from django.conf import settings
+                        })
 
-                # def send_api_verticalcontact_mail(sponsorname,date,time,patientname):
-                #     subject = "Your VeriMED Appointment Is Confirmed"
-                #     message = f"""
-                #         <p>Hello <strong>{sponsorname}</strong>,</p>
+                sponsor_user = getattr(effective_sponsor, "user", None)
+                sponsorname = (
+                    (getattr(sponsor_user, "first_name", None) or "").strip()
+                    or (getattr(sponsor_user, "username", None) or "").strip()
+                    or "Valued Family Member"
+                )
+                sponsoremail = (getattr(sponsor_user, "email", None) or "").strip()
+                departmentname = effective_dep.dep_name if effective_dep else None
+                doctorname = (
+                    effective_doc.user.first_name
+                    if effective_doc and effective_doc.user
+                    else None
+                )
+                patientname = (
+                    effective_patient.patient_name
+                    if effective_patient
+                    else None
+                )
+                caretakername = (
+                    effective_caretaker.user.first_name
+                    if effective_caretaker and effective_caretaker.user
+                    else None
+                )
+                date = appointmentobj.appointment_date
+                time = appointmentobj.appointment_time
+                print("sponsorname", sponsorname)
 
-                #         <p>
-                #             Your appointment with VeriMED’s physician-led, nurse-powered care team
-                #             has been <strong>confirmed</strong>.
-                #         </p>
+            from html import escape as html_escape
+            from django.core.mail import EmailMessage
+            from django.conf import settings
+            portal_url = getattr(
+                settings,
+                "FRONTEND_DASHBOARD_URL",
+                "https://verimed-fe.vercel.app/",
+            )
 
-                #         <p>
-                #             <strong>Date:</strong> {date}<br>
-                #             <strong>Time:</strong> {time}<br>
-                #             <strong>Provider:</strong> {patientname}
-                #         </p>
+            def send_api_care_update_mail(sponsorname, sponsoremail):
+                if not sponsoremail:
+                    return False, "Sponsor email address is missing."
 
-                #         <p>
-                #             Our mission is simple: deliver global-standard medical care to your loved one,
-                #             and provide you with complete clarity every step of the way.
-                #         </p>
+                subject = "Your appointment is confirmed and updated in your VeriMED Portal."
+                message = f"""
+                    <p>Dear <strong>{html_escape(sponsorname)}</strong>,</p>
 
-                #         <p>
-                #             If you need adjustments, please reach out through your portal.
-                #         </p>
+                    <p>Your appointment is confirmed.</p>
 
-                #         <p>
-                #             With gratitude,<br>
-                #             <strong>The VeriMED Clinical & Care Coordination Team</strong><br>
-                #             Physician-Led. Nurse-Powered. Cameroon’s Trusted Home Health Service.<br>
-                #             Global-Standard Medical Care for Loved Ones Back Home.
-                #         </p>
+                    <p>
+                        Our healthcare team will complete the service as scheduled, and the clinical
+                        documentation will be securely uploaded for your review.
+                    </p>
 
-                #         <p>www.Verimed.care ~~~ Serving Families Worldwide</p>
-                #         """
-                    
-                #     from_email = settings.DEFAULT_FROM_EMAIL
-                    
-                #     # ✅ Add three recipient emails
-                #     sponsoremail = spon_obj.user.email
-                #     doctoremail = doc_obj.user.email
-                #     caretakeremail = getattr(getattr(caretaker_obj, "user", None), "email", None)
-                #     print("dddddddddd")
+                    <p>Depending on the service and visit, the documentation may include:</p>
+                    <ul>
+                        <li>Clinical observations and nursing or physician notes</li>
+                        <li>Changes in health status</li>
+                        <li>Vital signs and assessment findings</li>
+                        <li>Medications or treatment updates</li>
+                        <li>Recommendations and follow-up plans</li>
+                        <li>Photos or supporting documents (when appropriate)</li>
+                    </ul>
 
-                #     recipient_list = [sponsoremail, doctoremail]
+                    <p>To review the latest information, simply log in to your VeriMED Portal at your convenience.</p>
 
-                    
-                #     try:
-                #         email_msg = EmailMessage(subject, "", from_email, recipient_list)
-                #         email_msg.content_subtype = "html"  # VERY IMPORTANT
-                #         email_msg.body = message
-                #         email_msg.send(fail_silently=False)
-                #         print("Appoinment Booking email sent successfully")
-                #         return True
-                #     except Exception as e:
-                #         print(f"Error sending vertical contact email: {e}")
-                #         return False
-                    
-                # send_api_verticalcontact_mail(sponsorname,date,time,patientname)
-                
-                def send_api_care_update_mail(sponsorname, patientname):
-                    subject = "Your appointment is confirmed a New Care Update is Available in Your VeriMED Portal"
-                    message = f"""
-                        <p>Dear <strong>{sponsorname}</strong>,</p>
+                    <p><strong>Login URL:</strong> <a href="{html_escape(portal_url)}">{html_escape(portal_url)}</a></p>
 
-                        <p>Your appointment is confirmed a new care update has been added to your VeriMED Family Portal.</p>
+                    <p>
+                        Your family's peace of mind is important to us. We remain committed to providing
+                        timely communication, compassionate care, and professional oversight so you can
+                        stay informed, wherever you are.
+                    </p>
 
-                        <p>
-                            Our healthcare team has completed today's visit with <strong>{patientname}</strong>,
-                            and the clinical documentation has now been securely uploaded for your review.
-                        </p>
+                    <p>Thank you for trusting VeriMED with your care and the care of your loved one.</p>
 
-                        <p>Depending on today's visit, your update may include:</p>
-                        <ul>
-                            <li>Clinical observations and nursing or physician notes</li>
-                            <li>Changes in health status</li>
-                            <li>Vital signs and assessment findings</li>
-                            <li>Medications or treatment updates</li>
-                            <li>Recommendations and follow-up plans</li>
-                            <li>Photos or supporting documents (when appropriate)</li>
-                        </ul>
+                    <p>
+                        Warm regards,<br>
+                        <strong>The VeriMED Care Team</strong><br>
+                        Bringing World-Class Healthcare to Cameroon<br>
+                        <a href="https://www.verimed.care">www.verimed.care</a>
+                    </p>
+                    """
 
-                        <p>To review the latest information, simply log in to your VeriMED Portal at your convenience.</p>
+                from_email = settings.DEFAULT_FROM_EMAIL
+                recipient_list = [sponsoremail]
 
-                        <p>
-                            Your family's peace of mind is important to us. We remain committed to providing
-                            timely communication, compassionate care, and professional oversight so you can
-                            stay informed, wherever you are.
-                        </p>
+                try:
+                    email_msg = EmailMessage(subject, "", from_email, recipient_list)
+                    email_msg.content_subtype = "html"  # VERY IMPORTANT
+                    email_msg.body = message
+                    email_msg.send(fail_silently=False)
+                    print("Appointment confirmation email sent successfully")
+                    return True, None
+                except Exception as e:
+                    print(f"Error sending appointment confirmation email: {e}")
+                    return False, str(e)
 
-                        <p>Thank you for trusting VeriMED with your care and the care of your loved one.</p>
+            email_sent, email_error = send_api_care_update_mail(sponsorname, sponsoremail)
 
-                        <p>
-                            Warm regards,<br>
-                            <strong>The VeriMED Care Team</strong><br>
-                            Bringing World-Class Healthcare to Cameroon<br>
-                            <a href="https://www.verimed.care">www.verimed.care</a>
-                        </p>
-                        """
-
-                    from_email = settings.DEFAULT_FROM_EMAIL
-
-                    sponsoremail = spon_obj.user.email
-
-                    recipient_list = [sponsoremail]
-
-                    try:
-                        email_msg = EmailMessage(subject, "", from_email, recipient_list)
-                        email_msg.content_subtype = "html"  # VERY IMPORTANT
-                        email_msg.body = message
-                        email_msg.send(fail_silently=False)
-                        print("Care update email sent successfully")
-                        return True
-                    except Exception as e:
-                        print(f"Error sending care update email: {e}")
-                        return False
-
-                send_api_care_update_mail(sponsorname, patientname)
-                        
-                return Response({"message": "Appointment updated successfully Check the Email"}, status=status.HTTP_200_OK)
+            response_message = (
+                "Appointment updated successfully Check the Email"
+                if email_sent
+                else "Appointment updated successfully, but confirmation email could not be sent."
+            )
+            return Response(
+                {
+                    "message": response_message,
+                    "email_sent": email_sent,
+                    **({"email_error": email_error} if email_error else {}),
+                },
+                status=status.HTTP_200_OK
+            )
 
         except Exception as e:
-            transaction.set_rollback(True)
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
@@ -2802,6 +2831,11 @@ class PatientProfileCreateUpdate(APIView):
                 sponsorname=sponsorobj.user.first_name
                 from django.core.mail import EmailMessage
                 from django.conf import settings
+                portal_url = getattr(
+                    settings,
+                    "FRONTEND_DASHBOARD_URL",
+                    "https://verimed-fe.vercel.app/",
+                )
 
                 
                 def send_api_verticalcontact_mail(sponsorname):
@@ -2823,6 +2857,7 @@ class PatientProfileCreateUpdate(APIView):
                     </p>
 
                     <p>Your VeriMED portal is now active. You can log in at any time to:</p>
+                    <p><strong>Login URL:</strong> <a href="{portal_url}">{portal_url}</a></p>
 
                     <ul>
                         <li>Schedule your own appointments</li>
@@ -3815,6 +3850,11 @@ class DoctorReportsCRUD(APIView):
                 
                 from django.core.mail import EmailMessage
                 from django.conf import settings
+                portal_url = getattr(
+                    settings,
+                    "FRONTEND_DASHBOARD_URL",
+                    "https://verimed-fe.vercel.app/",
+                )
 
                 def send_api_verticalcontact_mail(sponsorname):
                     subject = "Your VeriMED Service Report Will Be Available Soon"
@@ -3826,6 +3866,8 @@ class DoctorReportsCRUD(APIView):
                         Your recent VeriMED service or consultation has been completed.
                         A detailed report will be uploaded to your portal shortly for your review.
                     </p>
+
+                    <p><strong>Login URL:</strong> <a href="{portal_url}">{portal_url}</a></p>
 
                     <p>
                         Thank you for trusting VeriMED — the physician-led, nurse-powered, premium

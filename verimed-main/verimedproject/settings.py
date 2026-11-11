@@ -67,7 +67,7 @@ CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    "https://verimed-dashboard.vercel.app",
+    "https://verimed-fe.vercel.app",
     "https://verimed.care",
     "https://portal.verimed.care",
     "https://verimed-be.vercel.app",
@@ -77,7 +77,7 @@ CORS_ALLOWED_ORIGINS = [
 
 CSRF_TRUSTED_ORIGINS = [
     "https://verimedramja.pythonanywhere.com",
-    "https://verimed-dashboard.vercel.app",
+    "https://verimed-fe.vercel.app",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "http://localhost:8000",
@@ -251,19 +251,26 @@ AUTH_USER_MODEL = 'verimed.User'
 
 
 
-EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
-EMAIL_HOST = "smtp.gmail.com"
-EMAIL_USE_TLS = True
-EMAIL_PORT = 587
-EMAIL_HOST_USER = 'verimedglobal@gmail.com'
-EMAIL_HOST_PASSWORD = 'qoal msgr qfrk ckbt'
-DEFAULT_FROM_EMAIL = EMAIL_HOST_USER
+EMAIL_BACKEND = os.environ.get("EMAIL_BACKEND", "django.core.mail.backends.smtp.EmailBackend")
+EMAIL_HOST = os.environ.get("EMAIL_HOST", "smtp.gmail.com")
+EMAIL_USE_TLS = os.environ.get("EMAIL_USE_TLS", "True").lower() in ("true", "1", "yes")
+EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "587"))
+EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "verimedglobal@gmail.com")
+EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD", "qoal msgr qfrk ckbt")
+DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", EMAIL_HOST_USER)
+EMAIL_TIMEOUT = int(os.environ.get("EMAIL_TIMEOUT", "15"))
 
 
 # FRONTEND_URL = "http://localhost:3000"
 # FRONTEND_URL = "http://127.0.0.1:8000"
 
+# Backend origin fallback used by legacy media serializers and email verification endpoint
 FRONTEND_URL = "https://verimedramja.pythonanywhere.com/"
+
+# Deployed frontend dashboard URL included in portal login / notification emails
+FRONTEND_DASHBOARD_URL = os.environ.get(
+    "FRONTEND_DASHBOARD_URL", "https://verimed-fe.vercel.app/"
+)
 
 
 # import os
