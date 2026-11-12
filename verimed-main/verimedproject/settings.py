@@ -35,7 +35,7 @@ DEBUG = True
 # ALLOWED_HOSTS = ['*']
 
 ALLOWED_HOSTS = [
-    "verimedramja.pythonanywhere.com",
+    "verimed-be.vercel.app",
     "localhost",
     "127.0.0.1",
     "verimed.care",
@@ -76,7 +76,7 @@ CORS_ALLOWED_ORIGINS = [
 ]
 
 CSRF_TRUSTED_ORIGINS = [
-    "https://verimedramja.pythonanywhere.com",
+    "https://verimed-be.vercel.app",
     "https://verimed-fe.vercel.app",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
@@ -265,7 +265,9 @@ EMAIL_TIMEOUT = int(os.environ.get("EMAIL_TIMEOUT", "15"))
 # FRONTEND_URL = "http://127.0.0.1:8000"
 
 # Backend origin fallback used by legacy media serializers and email verification endpoint
-FRONTEND_URL = "https://verimedramja.pythonanywhere.com/"
+FRONTEND_URL = os.environ.get(
+    "FRONTEND_URL", "https://verimed-be.vercel.app"
+)
 
 # Deployed frontend dashboard URL included in portal login / notification emails
 FRONTEND_DASHBOARD_URL = os.environ.get(

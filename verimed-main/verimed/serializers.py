@@ -2,6 +2,29 @@ from rest_framework import serializers
 from .models import VerimedCountryCode,VerimedDepartment,VerimedBookAppointment,User,DoctorProfile,CareTakerProfile,PatientProfile,SponsorProfile,DoctorReports,ContactUs,KetnyproductionCheck
 from django.conf import settings
 
+
+def _build_media_url(raw_url, request=None, download=False):
+    if not raw_url:
+        return None
+
+    url = str(raw_url).strip()
+    if not url:
+        return None
+
+    if url.startswith(("http://", "https://")):
+        resolved = url
+    elif request is not None:
+        resolved = request.build_absolute_uri(url)
+    else:
+        base_url = getattr(settings, "FRONTEND_URL", "https://verimed-be.vercel.app").rstrip("/")
+        resolved = f"{base_url}/{url.lstrip('/')}"
+
+    if download and "download=" not in resolved:
+        separator = "&" if "?" in resolved else "?"
+        resolved = f"{resolved}{separator}download=true"
+
+    return resolved
+
 class VerimedCountryCodeViewSlr(serializers.ModelSerializer):
     class Meta:
         model = VerimedCountryCode
@@ -27,17 +50,16 @@ class UserViewSlr(serializers.ModelSerializer):
         return obj.country_code.code if obj.country_code else None
 
     def get_photo_view_url(self, obj):
+        if not obj.photo:
+            return None
         request = self.context.get("request")
-        if obj.photo:
-            # photo_url = obj.photo.url
-            # return request.build_absolute_uri(photo_url) if request else f"{settings.MEDIA_URL}{photo_url}"
-            return f"{settings.FRONTEND_URL}{obj.photo.url}?download=true"
-        return None
+        return _build_media_url(obj.photo.url, request=request, download=False)
 
     def get_photo_download_url(self, obj):
-        if obj.photo:
-            return f"{settings.FRONTEND_URL}{obj.photo.url}?download=true"
-        return None
+        if not obj.photo:
+            return None
+        request = self.context.get("request")
+        return _build_media_url(obj.photo.url, request=request, download=True)
     
     
 
@@ -214,29 +236,16 @@ class PatientProfileViewSlr(serializers.ModelSerializer):
    
     
     def get_photo_view_url(self, obj):
-        request = self.context.get("request")
-
         if not obj.photo:
             return None
-
-        if request:
-            return request.build_absolute_uri(obj.photo.url)
-
-        return f"{settings.FRONTEND_URL}{obj.photo.url}"
-
+        request = self.context.get("request")
+        return _build_media_url(obj.photo.url, request=request, download=False)
 
     def get_photo_download_url(self, obj):
-        request = self.context.get("request")
-
         if not obj.photo:
             return None
-
-        download_url = f"{obj.photo.url}?download=true"
-
-        if request:
-            return request.build_absolute_uri(download_url)
-
-        return f"{settings.FRONTEND_URL}{download_url}"
+        request = self.context.get("request")
+        return _build_media_url(obj.photo.url, request=request, download=True)
         # fields = "__all__"
 
 
@@ -304,10 +313,29 @@ class VerimedBookAppointmentViewSlr(serializers.ModelSerializer):
 
 
 class DoctorReportsViewSlr(serializers.ModelSerializer):
+    doctor_name = serializers.SerializerMethodField()
+    patient_display_name = serializers.SerializerMethodField()
+    uploaded_at = serializers.SerializerMethodField()
 
     class Meta:
         model = DoctorReports
         fields = '__all__'
+
+    def get_doctor_name(self, obj):
+        doc_user = getattr(getattr(obj, "doctor", None), "user", None)
+        if not doc_user:
+            return None
+        full = f"{doc_user.first_name or ''} {doc_user.last_name or ''}".strip()
+        return full or doc_user.username
+
+    def get_patient_display_name(self, obj):
+        if obj.patient_name and obj.patient_name != "N/A":
+            return obj.patient_name
+        return getattr(getattr(obj, "patient", None), "patient_name", None) or obj.patient_name
+
+    def get_uploaded_at(self, obj):
+        latest_file = obj.verimed_doctor_file_reports.order_by("-uploaded_at").first()
+        return latest_file.uploaded_at if latest_file else None
         
 class ContactUsViewSlr(serializers.ModelSerializer):
     class Meta:

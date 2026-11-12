@@ -49,6 +49,102 @@ def resolve_sponsor_profile_by_param(sponsor_val):
     ).first()
 
 
+def _parse_json_payload(raw_data):
+    if isinstance(raw_data, (dict, list)):
+        return raw_data, None
+    if isinstance(raw_data, str):
+        try:
+            return json.loads(raw_data), None
+        except Exception:
+            return None, "Invalid JSON format"
+    return None, "Invalid data type. Expected JSON string or dict."
+
+
+def _extract_id_list(request, field_name):
+    raw_values = []
+    if hasattr(request.data, "getlist"):
+        raw_values = request.data.getlist(field_name)
+        if len(raw_values) == 1 and raw_values[0] in (None, ""):
+            raw_values = []
+    if not raw_values:
+        raw = request.data.get(field_name, [])
+        if raw in (None, "", []):
+            raw_values = []
+        elif isinstance(raw, (list, tuple)):
+            raw_values = list(raw)
+        else:
+            raw_values = [raw]
+
+    flattened = []
+    for item in raw_values:
+        if item in (None, ""):
+            continue
+        if isinstance(item, (list, tuple)):
+            flattened.extend(item)
+        elif isinstance(item, str):
+            stripped = item.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                try:
+                    parsed = json.loads(stripped)
+                    if isinstance(parsed, list):
+                        flattened.extend(parsed)
+                        continue
+                except Exception:
+                    pass
+            for part in stripped.split(","):
+                part = part.strip()
+                if part:
+                    flattened.append(part)
+        else:
+            flattened.append(item)
+
+    valid_ids = []
+    invalid_ids = []
+    for val in flattened:
+        try:
+            valid_ids.append(int(val))
+        except (TypeError, ValueError):
+            invalid_ids.append(val)
+    return valid_ids, invalid_ids
+
+
+def _extract_str_list(data_source, field_name):
+    if hasattr(data_source, "getlist"):
+        vals = list(data_source.getlist(field_name))
+    else:
+        raw = data_source.get(field_name)
+        if raw in (None, ""):
+            vals = []
+        elif isinstance(raw, (list, tuple)):
+            vals = list(raw)
+        else:
+            vals = [raw]
+    if len(vals) == 1 and isinstance(vals[0], str) and "," in vals[0]:
+        return [part.strip() for part in vals[0].split(",")]
+    return vals
+
+
+def _format_phone_with_dial(dialcode, mobile):
+    if mobile is None:
+        return None
+    mobile_str = str(mobile).strip()
+    if not mobile_str:
+        return None
+    dial_str = str(dialcode).strip() if dialcode else ""
+    if dial_str:
+        dial_digits = dial_str.lstrip("+")
+        if mobile_str.startswith(f"{dial_str}-"):
+            return mobile_str
+        if mobile_str.startswith(dial_str):
+            rest = mobile_str[len(dial_str):].lstrip("- ")
+            return f"{dial_str}-{rest}" if rest else None
+        if dial_digits and mobile_str.startswith(f"{dial_digits}-"):
+            rest = mobile_str[len(dial_digits) + 1:].lstrip("- ")
+            return f"{dial_str}-{rest}" if rest else None
+        return f"{dial_str}-{mobile_str}"
+    return mobile_str
+
+
 def filter_queryset_by_sponsor(queryset, sponsor_profile):
     return queryset.filter(
         (
@@ -140,7 +236,7 @@ class UserSignup(APIView):
         )
 
         # --- SEND EMAIL ---
-        verification_link = f"{settings.FRONTEND_URL}/verimed/verify-email/?token={token}"
+        verification_link = f"{settings.FRONTEND_URL.rstrip('/')}/verimed/verify-email/?token={token}"
         send_mail(
             subject="Verify Your Email",
             message=f"Click the link to verify your email and complete signup: {verification_link}",
@@ -152,6 +248,8 @@ class UserSignup(APIView):
 
 
 class UserEmailVerify(APIView):
+    permission_classes = [AllowAny]
+
     def get(self, request):
         token = request.GET.get("token")
         if not token:
@@ -171,21 +269,22 @@ class UserEmailVerify(APIView):
         role = verification.role
         email = verification.email
         
-        country_code_obj=None
+        countrycode_obj = None
+        dialcode = None
         phonewithcountrycode = None
-        country_code = payload.get("country_code")
+        country_code = payload.get("country_code") or payload.get("countrycode")
         if country_code:
-            phone = payload.get("phone")
-            if phone: 
-                try:
-                    countrycode_obj = VerimedCountryCode.objects.get(code=country_code)
-                    dialcode = countrycode_obj.dial_code
-                    phonewithcountrycode = f"{dialcode}-{phone}"
-                except VerimedCountryCode.DoesNotExist:
-                    return Response(
-                        {"error": "Invalid Country Code"},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
+            try:
+                countrycode_obj = VerimedCountryCode.objects.get(code=country_code)
+                dialcode = countrycode_obj.dial_code
+            except VerimedCountryCode.DoesNotExist:
+                return Response(
+                    {"error": "Invalid Country Code"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        phone = payload.get("phone")
+        if phone:
+            phonewithcountrycode = _format_phone_with_dial(dialcode, phone)
                  
 
         try:
@@ -276,7 +375,11 @@ class UserEmailVerify(APIView):
 
                 
                 elif role == "patient":
-                    sponsor_id = payload.get("sponser_id")
+                    sponsor_id = (
+                        payload.get("sponser_id")
+                        or payload.get("sponsor_id")
+                        or payload.get("sponsorid")
+                    )
                     sponsor_obj = None  
 
                     if sponsor_id:
@@ -311,7 +414,7 @@ class UserEmailVerify(APIView):
                     caretaker_id = payload.get("caretaker_id") 
                     caretaker_obj = None  
 
-                    if sponsor_id:
+                    if caretaker_id:
                         try:
                             caretaker_id = int(caretaker_id)
                             try:
@@ -355,7 +458,7 @@ class UserEmailVerify(APIView):
                 
                 elif role == "admin":
                     last_data = AdminID.objects.last()
-                    admin_id = f"A{int(last_data.admin_id)}" if last_data else "A"
+                    admin_id = f"A{int(last_data.admin_id)}" if last_data else "A1"
                     if last_data:
                         last_data.admin_id = int(last_data.admin_id) + 1
                         last_data.save()
@@ -480,27 +583,23 @@ class UserView(APIView):
 
 
 class UserCreate(APIView):
-    
+    permission_classes = [AllowAny]
+
     def post(self, request):
-        
         user_signup_data_raw = request.data.get("user_signup")
         if not user_signup_data_raw:
             return Response({"error": "user_signup is mandatory"}, status=status.HTTP_400_BAD_REQUEST)
-        
-        # If user_update_data is a JSON string, parse it
-        if isinstance(user_signup_data_raw, str):
-            import json
-            try:
-                user_signup_data = json.loads(user_signup_data_raw)
-            except Exception:
-                return Response({"error": "Invalid JSON format"}, status=status.HTTP_400_BAD_REQUEST)
-            
+
+        user_signup_data, parse_err = _parse_json_payload(user_signup_data_raw)
+        if parse_err:
+            return Response({"error": parse_err}, status=status.HTTP_400_BAD_REQUEST)
+
          # Update photo if provided
-        photo = request.data.get("photo",None)
+        photo = request.data.get("photo", None)
         if photo:
-            photo=photo
-            
-        countrycode = user_signup_data.get("countrycode")
+            photo = photo
+
+        countrycode = user_signup_data.get("countrycode") or user_signup_data.get("country_code")
         if countrycode:
 
             try:
@@ -512,14 +611,16 @@ class UserCreate(APIView):
                     status=status.HTTP_400_BAD_REQUEST
                 )
         else:
-            countrycode_obj=None
-            dialcode=None
-        
+            countrycode_obj = None
+            dialcode = None
+
         mobile = user_signup_data.get("phone")
-        if mobile:
-            phonewithcountrycode = f"{dialcode}-{mobile}"
-        else:
-            phonewithcountrycode=None
+        phonewithcountrycode = _format_phone_with_dial(dialcode, mobile)
+        is_active = (
+            user_signup_data.get("is_active_state")
+            if user_signup_data.get("is_active_state") is not None
+            else True
+        )
         
         role =user_signup_data.get("role")
         if not role:
@@ -632,6 +733,8 @@ class UserCreate(APIView):
 
                     <p>www.Verimed.care ~~~ Serving Families Worldwide</p>
                     """
+                    if not (email or "").strip():
+                        return False
                     from_email = settings.DEFAULT_FROM_EMAIL
                     recipient_list = [email]
 
@@ -729,6 +832,8 @@ class UserCreate(APIView):
                         <a href="https://www.verimed.care">www.verimed.care</a>
                     </p>
                     """
+                    if not (email or "").strip():
+                        return False
                     from_email = settings.DEFAULT_FROM_EMAIL
                     recipient_list = [email]
 
@@ -762,7 +867,7 @@ class UserCreate(APIView):
                         photo=photo,
                         service_purchased=user_signup_data.get("service_purchased"),
                         password=make_password(user_signup_data.get("password")),
-                        is_active_state = user_signup_data.get("is_active_state")
+                        is_active_state=is_active
                     )
 
                     SponsorProfile.objects.create(
@@ -773,7 +878,12 @@ class UserCreate(APIView):
 
                     # ✅ Soft delete (mark token as used)
                     # verification.mark_as_used()
-                    send_api_verticalcontact_mail(user.first_name,user.username, user_signup_data.get("password"), user.email)
+                    send_api_verticalcontact_mail(
+                        user.first_name or user.username or "Valued Family Member",
+                        user.username,
+                        user_signup_data.get("password"),
+                        user.email,
+                    )
 
                     response_msg = {"message": "Sponsor created successfully Check the Email", "sponsor_id": sponsor_id}
                 
@@ -794,8 +904,7 @@ class UserCreate(APIView):
                         photo=photo,
                         service_purchased=user_signup_data.get("service_purchased"),
                         password=make_password(user_signup_data.get("password")),
-                        is_active_state = user_signup_data.get("is_active_state")
-
+                        is_active_state=is_active
                     )
 
                     DoctorProfile.objects.create(
@@ -807,7 +916,12 @@ class UserCreate(APIView):
                     # verification.mark_as_used()
                     
                     
-                    send_api_verticalcontact_mail(user.first_name,user.username, user_signup_data.get("password"), user.email)
+                    send_api_verticalcontact_mail(
+                        user.first_name or user.username or "Doctor",
+                        user.username,
+                        user_signup_data.get("password"),
+                        user.email,
+                    )
                     response_msg = {"message": "Doctor created successfully Check the Email", "doctor_id": doctor_id}
 
                 elif role == "care_taker":
@@ -827,8 +941,7 @@ class UserCreate(APIView):
                         photo=photo,
                         service_purchased=user_signup_data.get("service_purchased"),
                         password=make_password(user_signup_data.get("password")),
-                        is_active_state = user_signup_data.get("is_active_state")
-
+                        is_active_state=is_active
                     )
 
                     CareTakerProfile.objects.create(
@@ -839,7 +952,12 @@ class UserCreate(APIView):
                     # ✅ Soft delete (mark token as used)
                     # verification.mark_as_used()
 
-                    send_api_caretaker_mail(user.first_name,user.username, user_signup_data.get("password"), user.email)
+                    send_api_caretaker_mail(
+                        user.first_name or user.username or "Team Member",
+                        user.username,
+                        user_signup_data.get("password"),
+                        user.email,
+                    )
                     response_msg = {"message": "CareTaker created successfully Check the Email", "caretaker_id": caretaker_id}
 
                 
@@ -924,7 +1042,7 @@ class UserCreate(APIView):
                 
                 elif role == "admin":
                     last_data = AdminID.objects.last()
-                    admin_id = f"A{int(last_data.admin_id)}" if last_data else "A"
+                    admin_id = f"A{int(last_data.admin_id)}" if last_data else "A1"
                     if last_data:
                         last_data.admin_id = int(last_data.admin_id) + 1
                         last_data.save()
@@ -939,8 +1057,7 @@ class UserCreate(APIView):
                         photo=photo,
                         service_purchased=user_signup_data.get("service_purchased"),
                         password=make_password(user_signup_data.get("password")),
-                        is_active_state = user_signup_data.get("is_active_state")
-
+                        is_active_state=is_active
                     )
 
                     AdminProfile.objects.create(
@@ -951,8 +1068,13 @@ class UserCreate(APIView):
                     # ✅ Soft delete (mark token as used)
                     # verification.mark_as_used()
                     
-                    send_api_verticalcontact_mail(user.first_name,user.username, user_signup_data.get("password"), user.email)
-                    response_msg = {"message": "Admin created successfullyCheck the Email ", "admin_id": admin_id}
+                    send_api_verticalcontact_mail(
+                        user.first_name or user.username or "Admin",
+                        user.username,
+                        user_signup_data.get("password"),
+                        user.email,
+                    )
+                    response_msg = {"message": "Admin created successfully Check the Email", "admin_id": admin_id}
 
                 
                 else:
@@ -974,17 +1096,13 @@ class UserUpdate(APIView):
 
     def patch(self, request):
         # Ensure 'user_update_data' exists
-        user_update_data = request.data.get("user_update_data")
-        if not user_update_data:
+        user_update_data_raw = request.data.get("user_update_data")
+        if not user_update_data_raw:
             return Response({"error": "data is mandatory"}, status=status.HTTP_400_BAD_REQUEST)
         
-        # If user_update_data is a JSON string, parse it
-        if isinstance(user_update_data, str):
-            import json
-            try:
-                user_update_data = json.loads(user_update_data)
-            except Exception:
-                return Response({"error": "Invalid JSON format"}, status=status.HTTP_400_BAD_REQUEST)
+        user_update_data, parse_err = _parse_json_payload(user_update_data_raw)
+        if parse_err:
+            return Response({"error": parse_err}, status=status.HTTP_400_BAD_REQUEST)
 
         # Get user object
         try:
@@ -992,27 +1110,31 @@ class UserUpdate(APIView):
         except User.DoesNotExist:
             return Response({"error": "Give me a valid user"}, status=status.HTTP_404_NOT_FOUND)
         
-        countrycode = user_update_data.get("countrycode")
-        if countrycode:
-
-            try:
-                countrycode_obj = VerimedCountryCode.objects.get(code=countrycode)
-                dialcode = countrycode_obj.dial_code
-            except VerimedCountryCode.DoesNotExist:
-                return Response(
-                    {"error": "Invalid Country Code"},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
+        has_country_code = "countrycode" in user_update_data or "country_code" in user_update_data
+        if has_country_code:
+            countrycode = user_update_data.get("countrycode")
+            if countrycode is None:
+                countrycode = user_update_data.get("country_code")
+            if countrycode:
+                try:
+                    countrycode_obj = VerimedCountryCode.objects.get(code=countrycode)
+                    dialcode = countrycode_obj.dial_code
+                except VerimedCountryCode.DoesNotExist:
+                    return Response(
+                        {"error": "Invalid Country Code"},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+            else:
+                countrycode_obj = None
+                dialcode = None
         else:
-            countrycode_obj=None
-            dialcode=None
+            countrycode_obj = user.country_code
+            dialcode = countrycode_obj.dial_code if countrycode_obj else None
         
-        mobile = user_update_data.get("phone")
-        if mobile:
-            phonewithcountrycode = f"{dialcode}-{mobile}"
-        else:
-            phonewithcountrycode=None
-        
+        has_phone = "phone" in user_update_data
+        if has_phone:
+            mobile = user_update_data.get("phone")
+            phonewithcountrycode = _format_phone_with_dial(dialcode, mobile)
       
         try:
             with transaction.atomic():
@@ -1022,9 +1144,11 @@ class UserUpdate(APIView):
                 user.last_name = user_update_data.get("last_name", user.last_name)
                 user.email = user_update_data.get("email", user.email)
                 user.service_purchased = user_update_data.get("service_purchased", user.service_purchased)
-                user.country_code = countrycode_obj
-                user.phone = phonewithcountrycode
-                user.is_active_state = user_update_data.get("is_active_state",user.is_active_state)
+                if has_country_code:
+                    user.country_code = countrycode_obj
+                if has_phone:
+                    user.phone = phonewithcountrycode
+                user.is_active_state = user_update_data.get("is_active_state", user.is_active_state)
 
                 # user.role = user_update_data.get("role", user.role)
 
@@ -1039,15 +1163,7 @@ class UserUpdate(APIView):
                     user.password = make_password(password)
 
                 user.save()
-                print("userid",user.id)
-                codes = user.country_code.id if user and user.country_code else None
-                print("codes",codes)
-                # print(type(codes))
-                if codes:
-                    codee = VerimedCountryCode.objects.get(id=codes)
-                    code =codee.code
-                else:
-                    code=None
+                code = user.country_code.code if user and user.country_code else None
                 
                 return Response({
                     "message": "User updated successfully",
@@ -1056,10 +1172,10 @@ class UserUpdate(APIView):
                         "first_name": user.first_name,
                         "last_name": user.last_name,
                         "email": user.email,
-                        "countrycode":code,
+                        "countrycode": code,
                         "phone": user.phone,
                         "role": user.user_role,
-                        "service_purchased":user.service_purchased
+                        "service_purchased": user.service_purchased
                     }
                 }, status=status.HTTP_200_OK)
                 
@@ -1071,52 +1187,50 @@ class UserUpdate(APIView):
                 
 
 class UserUpdateUser(APIView):
+    permission_classes = [AllowAny]
 
     def patch(self, request):
         # Ensure 'user_update_data' exists
-        user_update_data = request.data.get("user_update_data")
-        if not user_update_data:
+        user_update_data_raw = request.data.get("user_update_data")
+        if not user_update_data_raw:
             return Response({"error": "data is mandatory"}, status=status.HTTP_400_BAD_REQUEST)
         
-        # If user_update_data is a JSON string, parse it
-        if isinstance(user_update_data, str):
-            import json
-            try:
-                user_update_data = json.loads(user_update_data)
-            except Exception:
-                return Response({"error": "Invalid JSON format"}, status=status.HTTP_400_BAD_REQUEST)
+        user_update_data, parse_err = _parse_json_payload(user_update_data_raw)
+        if parse_err:
+            return Response({"error": parse_err}, status=status.HTTP_400_BAD_REQUEST)
 
-
-        username=user_update_data.get("username")
+        username = user_update_data.get("username")
         # Get user object
         try:
             user = User.objects.get(username=username)
         except User.DoesNotExist:
             return Response({"error": f"no user name found {username}"}, status=status.HTTP_404_NOT_FOUND)        
         
-        
-        
-        countrycode = user_update_data.get("countrycode")
-        if countrycode:
-
-            try:
-                countrycode_obj = VerimedCountryCode.objects.get(code=countrycode)
-                dialcode = countrycode_obj.dial_code
-            except VerimedCountryCode.DoesNotExist:
-                return Response(
-                    {"error": "Invalid Country Code"},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
+        has_country_code = "countrycode" in user_update_data or "country_code" in user_update_data
+        if has_country_code:
+            countrycode = user_update_data.get("countrycode")
+            if countrycode is None:
+                countrycode = user_update_data.get("country_code")
+            if countrycode:
+                try:
+                    countrycode_obj = VerimedCountryCode.objects.get(code=countrycode)
+                    dialcode = countrycode_obj.dial_code
+                except VerimedCountryCode.DoesNotExist:
+                    return Response(
+                        {"error": "Invalid Country Code"},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+            else:
+                countrycode_obj = None
+                dialcode = None
         else:
-            countrycode_obj=None
-            dialcode=None
+            countrycode_obj = user.country_code
+            dialcode = countrycode_obj.dial_code if countrycode_obj else None
         
-        mobile = user_update_data.get("phone")
-        if mobile:
-            phonewithcountrycode = f"{dialcode}-{mobile}"
-        else:
-            phonewithcountrycode=None
-        
+        has_phone = "phone" in user_update_data
+        if has_phone:
+            mobile = user_update_data.get("phone")
+            phonewithcountrycode = _format_phone_with_dial(dialcode, mobile)
       
         try:
             with transaction.atomic():
@@ -1126,13 +1240,11 @@ class UserUpdateUser(APIView):
                 user.last_name = user_update_data.get("last_name", user.last_name)
                 user.email = user_update_data.get("email", user.email)
                 user.service_purchased = user_update_data.get("service_purchased", user.service_purchased)
-                if countrycode:
+                if has_country_code:
                     user.country_code = countrycode_obj
-                if phonewithcountrycode:
+                if has_phone and phonewithcountrycode:
                     user.phone = phonewithcountrycode
-                user.is_active_state = user_update_data.get("is_active_state",user.is_active_state)
-
-                # user.role = user_update_data.get("role", user.role)
+                user.is_active_state = user_update_data.get("is_active_state", user.is_active_state)
 
                 # Update photo if provided
                 photo = request.data.get("photo")   
@@ -1142,9 +1254,7 @@ class UserUpdateUser(APIView):
                 # Update password if provided
                 password = user_update_data.get("password")
                 if password:
-                    print("password",password)
                     user.password = make_password(password)
-                    
 
                 user.save()
 
@@ -1156,9 +1266,8 @@ class UserUpdateUser(APIView):
                     "https://verimed-fe.vercel.app/",
                 )
                 
-                if password:
+                if password and (user.email or "").strip():
                     def send_api_verticalcontact_mail():
-                    
                         subject = "Welcome to VeriMED — User Updated Sucessfully"
 
                         message = f"""
@@ -1171,7 +1280,6 @@ class UserUpdateUser(APIView):
                         recipient_list = [user.email]
                         
                         try:
-                            # email_msg = EmailMessage(subject, message, from_email, recipient_list)
                             email_msg = EmailMessage(subject, "", from_email, recipient_list)
                             email_msg.content_subtype = "html"  # VERY IMPORTANT
                             email_msg.body = message
@@ -1183,14 +1291,7 @@ class UserUpdateUser(APIView):
                             return False
                     send_api_verticalcontact_mail()
 
-                codes = user.country_code.id if user and user.country_code else None
-                # print("codes",codes)
-                # print(type(codes))
-                if codes:
-                    codee = VerimedCountryCode.objects.get(id=codes)
-                    code =codee.code
-                else:
-                    code=None
+                code = user.country_code.code if user and user.country_code else None
                     
                 return Response({
                     "message": "User updated successfully",
@@ -1199,10 +1300,10 @@ class UserUpdateUser(APIView):
                         "first_name": user.first_name,
                         "last_name": user.last_name,
                         "email": user.email,
-                        "countrycode":code,
+                        "countrycode": code,
                         "phone": user.phone,
                         "role": user.user_role,
-                        "service_purchased":user.service_purchased
+                        "service_purchased": user.service_purchased
                     }
                 }, status=status.HTTP_200_OK)
                 
@@ -1224,23 +1325,17 @@ class UserDelete(APIView):
     
 
     def delete(self, request):
-        # Get list of IDs from request data
-        if hasattr(request.data, "getlist"):
-            delete_ids = request.data.getlist("deleteids")  # form-data
-        else:
-            delete_ids = request.data.get("deleteids", [])  # JSON list
+        valid_ids, invalid_format_ids = _extract_id_list(request, "deleteids")
 
-        if not delete_ids:
+        if not valid_ids and not invalid_format_ids:
             return Response(
                 {"error": "No user IDs provided."},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        notvalidids = []
+        notvalidids = list(invalid_format_ids)
 
-        for i in delete_ids:
-            try:
-                user = User.objects.get(id=i)
-            except User.DoesNotExist:
+        for i in valid_ids:
+            if not User.objects.filter(id=i).exists():
                 notvalidids.append(i)
 
         if notvalidids:
@@ -1252,21 +1347,11 @@ class UserDelete(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        
         try:
             with transaction.atomic():
-                for user_id in delete_ids:
-                    try:
-                        user = User.objects.get(id=user_id)
-                        user.delete()
-                       
-                    except User.DoesNotExist:
-                        return Response({"error":"Give me  a valid User ID"})
-               
+                User.objects.filter(id__in=valid_ids).delete()
                 return Response(
-                    {   "message": "User Deleted successfully",
-                       
-                    },
+                    {"message": "User Deleted successfully"},
                     status=status.HTTP_200_OK
                 )
 
@@ -1286,31 +1371,22 @@ class VerimedDepartmentCreateUpdate(APIView):
     def post(self, request):
 
         raw_data = request.data.get("verimed_department")
-        print("raw_data", raw_data)
-        
-        if isinstance(raw_data, str):
-            try:
-                dep_data = json.loads(raw_data)
-            except json.JSONDecodeError:
-                return Response({"error": "Invalid JSON format"}, status=status.HTTP_400_BAD_REQUEST)
-        elif isinstance(raw_data, dict):
-            dep_data = raw_data
-        else:
-            return Response(
-                {"error": "Invalid data type. Expected JSON string or dict."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        if not raw_data:
+            return Response({"error": "verimed_department is mandatory"}, status=status.HTTP_400_BAD_REQUEST)
+        dep_data, parse_err = _parse_json_payload(raw_data)
+        if parse_err:
+            return Response({"error": parse_err}, status=status.HTTP_400_BAD_REQUEST)
+
         doc_id = dep_data.get("docid") 
-        doc_obj =None
+        doc_obj = None
         if doc_id:
             try:
                 doc_obj = DoctorProfile.objects.get(id=doc_id)
             except DoctorProfile.DoesNotExist:
                 return Response({"error": "Invalid doctor ID"}, status=status.HTTP_404_NOT_FOUND)
 
-        countrycode = dep_data.get("country_code")
+        countrycode = dep_data.get("country_code") or dep_data.get("countrycode")
         if countrycode:
-
             try:
                 countrycode_obj = VerimedCountryCode.objects.get(code=countrycode)
                 dialcode = countrycode_obj.dial_code
@@ -1320,21 +1396,16 @@ class VerimedDepartmentCreateUpdate(APIView):
                     status=status.HTTP_400_BAD_REQUEST
                 )
         else:
-            countrycode_obj=None
-            dialcode=None
+            countrycode_obj = None
+            dialcode = None
         
         mobile = dep_data.get("contact_phone")
-        if mobile:
-            phonewithcountrycode = f"{dialcode}-{mobile}"
-        else:
-            phonewithcountrycode=None
-        
+        phonewithcountrycode = _format_phone_with_dial(dialcode, mobile)
        
         # --- MAIN TRANSACTION ---
         try:
             with transaction.atomic():
-                # Create main asset_cleaned_data.get("department")
-                verimeddepartment = VerimedDepartment.objects.create(
+                VerimedDepartment.objects.create(
                     dep_name=dep_data.get("dep_name"),
                     dep_type=dep_data.get("dep_type"),
                     contact_email=dep_data.get("contact_email"),                    
@@ -1361,82 +1432,86 @@ class VerimedDepartmentCreateUpdate(APIView):
     def patch(self, request):
 
             raw_data = request.data.get("verimed_department")
-            print("raw_data", raw_data)
-            
-            if isinstance(raw_data, str):
-                try:
-                    dep_data = json.loads(raw_data)
-                except json.JSONDecodeError:
-                    return Response({"error": "Invalid JSON format"}, status=status.HTTP_400_BAD_REQUEST)
-            elif isinstance(raw_data, dict):
-                dep_data = raw_data
-            else:
-                return Response(
-                    {"error": "Invalid data type. Expected JSON string or dict."},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
+            if not raw_data:
+                return Response({"error": "verimed_department is mandatory"}, status=status.HTTP_400_BAD_REQUEST)
+            dep_data, parse_err = _parse_json_payload(raw_data)
+            if parse_err:
+                return Response({"error": parse_err}, status=status.HTTP_400_BAD_REQUEST)
                 
-            depupdateid =dep_data.get("depupdateid") 
+            depupdateid = dep_data.get("depupdateid") 
             if depupdateid:
                 try:
                     dep_obj = VerimedDepartment.objects.get(id=depupdateid)
                 except VerimedDepartment.DoesNotExist:
-            
                     return Response({"error": "Invalid DepartmentUpdateid ID"}, status=status.HTTP_404_NOT_FOUND)
             else:
-                return Response  ({"error": "depupdateid is Mandatory."},
+                return Response(
+                    {"error": "depupdateid is Mandatory."},
                     status=status.HTTP_400_BAD_REQUEST
                 )
                 
-            doc_id = dep_data.get("docid") 
-            print("doc_id",doc_id)
-            doc_obj =None
-            if doc_id:
-                try:
-                    doc_obj = DoctorProfile.objects.get(id=doc_id)
-                except DoctorProfile.DoesNotExist:
-                    return Response({"error": "Invalid doctor ID"}, status=status.HTTP_404_NOT_FOUND)
+            has_docid = "docid" in dep_data
+            doc_obj = dep_obj.doctor
+            if has_docid:
+                doc_id = dep_data.get("docid")
+                if doc_id:
+                    try:
+                        doc_obj = DoctorProfile.objects.get(id=doc_id)
+                    except DoctorProfile.DoesNotExist:
+                        return Response({"error": "Invalid doctor ID"}, status=status.HTTP_404_NOT_FOUND)
+                else:
+                    doc_obj = None
 
-            countrycode = dep_data.get("country_code")
-            if countrycode:
-
-                try:
-                    countrycode_obj = VerimedCountryCode.objects.get(code=countrycode)
-                    dialcode = countrycode_obj.dial_code
-                except VerimedCountryCode.DoesNotExist:
-                    return Response(
-                        {"error": "Invalid Country Code"},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
+            has_country_code = "country_code" in dep_data or "countrycode" in dep_data
+            if has_country_code:
+                countrycode = dep_data.get("country_code")
+                if countrycode is None:
+                    countrycode = dep_data.get("countrycode")
+                if countrycode:
+                    try:
+                        countrycode_obj = VerimedCountryCode.objects.get(code=countrycode)
+                        dialcode = countrycode_obj.dial_code
+                    except VerimedCountryCode.DoesNotExist:
+                        return Response(
+                            {"error": "Invalid Country Code"},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+                else:
+                    countrycode_obj = None
+                    dialcode = None
             else:
-                countrycode_obj=None
-                dialcode=None
+                countrycode_obj = dep_obj.country_code
+                dialcode = countrycode_obj.dial_code if countrycode_obj else None
             
-            mobile = dep_data.get("contact_phone")
-            if mobile:
-                phonewithcountrycode = f"{dialcode}-{mobile}"
-            else:
-                phonewithcountrycode=None
-            
+            has_phone = "contact_phone" in dep_data
+            if has_phone:
+                mobile = dep_data.get("contact_phone")
+                phonewithcountrycode = _format_phone_with_dial(dialcode, mobile)
         
             # --- MAIN TRANSACTION ---
             try:
                 with transaction.atomic():
-                    
-                    dep_obj.dep_name=dep_data.get("dep_name")
-                    dep_obj.dep_type=dep_data.get("dep_type")
-                    dep_obj.contact_email=dep_data.get("contact_email")                  
-                    dep_obj.country_code=countrycode_obj
-                    dep_obj.contact_phone=phonewithcountrycode
-                    dep_obj.address=dep_data.get("address")
-                    dep_obj.description=dep_data.get("description")
-                    dep_obj.dep_ID=dep_data.get("dep_ID")
-                    dep_obj.status=dep_data.get("status")
-                    dep_obj.doctor=doc_obj
-                    dep_obj.dep_city=dep_data.get("dep_city")
-                    dep_obj.dep_state=dep_data.get("dep_state")
-                    dep_obj.dep_country=dep_data.get("dep_country")
-                    dep_obj.dep_pincode=dep_data.get("dep_pincode")
+                    for field in [
+                        "dep_name",
+                        "dep_type",
+                        "contact_email",
+                        "address",
+                        "description",
+                        "dep_ID",
+                        "status",
+                        "dep_city",
+                        "dep_state",
+                        "dep_country",
+                        "dep_pincode",
+                    ]:
+                        if field in dep_data:
+                            setattr(dep_obj, field, dep_data.get(field))
+                    if has_country_code:
+                        dep_obj.country_code = countrycode_obj
+                    if has_phone:
+                        dep_obj.contact_phone = phonewithcountrycode
+                    if has_docid:
+                        dep_obj.doctor = doc_obj
                     dep_obj.save()
                     
                     return Response(
@@ -1458,23 +1533,17 @@ class VerimedDepartmentCreateUpdate(APIView):
     
         
     def delete(self, request):
-        # Get list of IDs from request data
-        if hasattr(request.data, "getlist"):
-            departmentdeleteids = request.data.get("departmentdeleteids")  # form-data
-        else:
-            departmentdeleteids = request.data.get("departmentdeleteids", [])  # JSON list
+        valid_ids, invalid_format_ids = _extract_id_list(request, "departmentdeleteids")
 
-        if not departmentdeleteids:
+        if not valid_ids and not invalid_format_ids:
             return Response(
                 {"error": "No Department Delete IDs provided."},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        notvalidids = []
+        notvalidids = list(invalid_format_ids)
 
-        for i in departmentdeleteids:
-            try:
-                department = VerimedDepartment.objects.get(id=i)
-            except VerimedDepartment.DoesNotExist:
+        for i in valid_ids:
+            if not VerimedDepartment.objects.filter(id=i).exists():
                 notvalidids.append(i)
 
         if notvalidids:
@@ -1486,23 +1555,13 @@ class VerimedDepartmentCreateUpdate(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        
         try:
             with transaction.atomic():
-                for dep_id in departmentdeleteids:
-                    try:
-                        dep = VerimedDepartment.objects.get(id=dep_id)
-                        dep.delete()
-                
-                    except VerimedDepartment.DoesNotExist:
-                        return Response({"error":"Give me  a valid Department ID"})
-               
+                VerimedDepartment.objects.filter(id__in=valid_ids).delete()
                 return Response(
-                    {   "message": "Department Deleted successfully",
-                        
-                    },
-                            status=status.HTTP_200_OK
-                        )
+                    {"message": "Department Deleted successfully"},
+                    status=status.HTTP_200_OK
+                )
 
         except Exception as e:
             return Response(
@@ -2161,14 +2220,10 @@ class VerimedBookAppoinmentCreateUpdate(APIView):
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    def delete(self,request):
-        # Get list of IDs from request data
-        if hasattr(request.data, "getlist"):
-            appoinmentdeleteids = request.data.get("appoinmentdeleteids")  # form-data
-        else:
-            appoinmentdeleteids = request.data.get("appoinmentdeleteids", [])  # JSON list
+    def delete(self, request):
+        valid_ids, invalid_format_ids = _extract_id_list(request, "appoinmentdeleteids")
 
-        if not appoinmentdeleteids:
+        if not valid_ids and not invalid_format_ids:
             return Response(
                 {"error": "No Appoinment Deleted IDs provided."},
                 status=status.HTTP_400_BAD_REQUEST
@@ -2179,11 +2234,12 @@ class VerimedBookAppoinmentCreateUpdate(APIView):
         if sponsor_user and logged_sponsor is None:
             return Response({"error": "Sponsor profile not found."}, status=status.HTTP_403_FORBIDDEN)
         
-        notvalidids = []
+        notvalidids = list(invalid_format_ids)
+        appointments_to_delete = []
         
-        for i in appoinmentdeleteids:
+        for i in valid_ids:
             try:
-                appointmentdeleteobj=VerimedBookAppointment.objects.get(id=i)
+                appointmentdeleteobj = VerimedBookAppointment.objects.get(id=i)
                 if sponsor_user:
                     owns_appointment = (
                         appointmentdeleteobj.sponsor_id == logged_sponsor.id
@@ -2194,6 +2250,7 @@ class VerimedBookAppoinmentCreateUpdate(APIView):
                             {"error": "You do not have permission to delete another sponsor's appointment."},
                             status=status.HTTP_403_FORBIDDEN
                         )
+                appointments_to_delete.append(appointmentdeleteobj)
             except VerimedBookAppointment.DoesNotExist:
                 notvalidids.append(i)
 
@@ -2206,25 +2263,15 @@ class VerimedBookAppoinmentCreateUpdate(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        
-        
-        # --- DATABASE DE choose LETE ---
+        # --- DATABASE DELETE ---
         try:
             with transaction.atomic():
-                for i in appoinmentdeleteids:
-                    try:
-                        appointmentdeleteobj = VerimedBookAppointment.objects.get(id=i)
-
-                        # Delete related documents
-                        VerimedBookAppointmentLabReports.objects.filter(
-                            referid=appointmentdeleteobj.id,
-                        ).delete()
-
-                        # Delete the award
-                        appointmentdeleteobj.delete()
-                             
-                    except VerimedBookAppointment.DoesNotExist:
-                        return Response({"error": "Invalid Appoinment Deleteid ID"}, status=status.HTTP_404_NOT_FOUND)
+                for appointmentdeleteobj in appointments_to_delete:
+                    VerimedBookAppointmentLabReports.objects.filter(
+                        Q(appointment=appointmentdeleteobj)
+                        | Q(referid=str(appointmentdeleteobj.id))
+                    ).delete()
+                    appointmentdeleteobj.delete()
 
                 return Response({"message": "Appoinment  Deleted sucessfully"}, status=status.HTTP_200_OK)
                     
@@ -2441,69 +2488,74 @@ class DoctorProfileUpdate(APIView):
     authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated]
     
-    def patch(self,request):
+    def patch(self, request):
         update_data = request.data.get("doctorprofile_update_data")
         if not update_data:
             return Response({"error": "data is mandatory"}, status=status.HTTP_400_BAD_REQUEST)
         
-        # If user_update_data is a JSON string, parse it
-        if isinstance(update_data, str):
-            import json
-            try:
-                data = json.loads(update_data)
-            except Exception:
-                return Response({"error": "Invalid JSON format"}, status=status.HTTP_400_BAD_REQUEST)
-
+        data, parse_err = _parse_json_payload(update_data)
+        if parse_err:
+            return Response({"error": parse_err}, status=status.HTTP_400_BAD_REQUEST)
         
         try:
-            doc_updateobj= DoctorProfile.objects.get(id=data.get("doc_profile_updateid"))
+            doc_updateobj = DoctorProfile.objects.get(id=data.get("doc_profile_updateid"))
         except DoctorProfile.DoesNotExist:
             return Response({"error": "Give me a valid DoctorProfile"}, status=status.HTTP_404_NOT_FOUND)
         
-        dep_obj=None
-        dep = data.get("dep")
-        if dep:
-            try:
-                dep_obj= VerimedDepartment.objects.get(id=dep)
-            except VerimedDepartment.DoesNotExist:
-                return Response({"error": "Give me a valid DoctorProfile"}, status=status.HTTP_404_NOT_FOUND)
+        has_dep = "dep" in data
+        dep_obj = doc_updateobj.dep
+        if has_dep:
+            dep = data.get("dep")
+            if dep:
+                try:
+                    dep_obj = VerimedDepartment.objects.get(id=dep)
+                except VerimedDepartment.DoesNotExist:
+                    return Response({"error": "Give me a valid Department"}, status=status.HTTP_404_NOT_FOUND)
+            else:
+                dep_obj = None
     
-        
-        countrycode_obj=None
-        countrycode = data.get("doc_country_code")
-        if countrycode:
-            mobile = data.get("doc_phone")
-            if mobile: 
+        has_country_code = "doc_country_code" in data
+        if has_country_code:
+            countrycode = data.get("doc_country_code")
+            if countrycode:
                 try:
                     countrycode_obj = VerimedCountryCode.objects.get(code=countrycode)
                     dialcode = countrycode_obj.dial_code
-                    phonewithcountrycode = f"{dialcode}-{mobile}"
                 except VerimedCountryCode.DoesNotExist:
                     return Response(
                         {"error": "Invalid Country Code"},
                         status=status.HTTP_400_BAD_REQUEST
                     )
+            else:
+                countrycode_obj = None
+                dialcode = None
+        else:
+            countrycode_obj = doc_updateobj.doc_country_code
+            dialcode = countrycode_obj.dial_code if countrycode_obj else None
+
+        has_phone = "doc_phone" in data
+        if has_phone:
+            phonewithcountrycode = _format_phone_with_dial(dialcode, data.get("doc_phone"))
         
         try:
             with transaction.atomic():
-                if dep_obj:
+                if has_dep:
                     doc_updateobj.dep = dep_obj
-                if countrycode_obj:
+                if has_country_code:
                     doc_updateobj.doc_country_code = countrycode_obj
+                if has_phone:
                     doc_updateobj.doc_phone = phonewithcountrycode
-                else:
-                    doc_updateobj.doc_phone = data.get("doc_phone", doc_updateobj.doc_phone)
 
-                doc_updateobj.doc_address=data.get("doc_address",doc_updateobj.doc_address)
-                doc_updateobj.doc_exprience=data.get("doc_exprience",doc_updateobj.doc_exprience)
-                doc_updateobj.doc_gender=data.get("doc_gender",doc_updateobj.doc_gender)
-                doc_updateobj.speciality=data.get("speciality",doc_updateobj.speciality)
-                doc_updateobj.joining_date=data.get("joining_date",doc_updateobj.joining_date)
-                doc_updateobj.doc_licence_no=data.get("doc_licence_no",doc_updateobj.doc_licence_no)
-                doc_updateobj.doc_city=data.get("doc_city",doc_updateobj.doc_city)
-                doc_updateobj.doc_state=data.get("doc_state",doc_updateobj.doc_state)
-                doc_updateobj.doc_country=data.get("doc_country",doc_updateobj.doc_country)
-                doc_updateobj.doc_pincode=data.get("doc_pincode",doc_updateobj.doc_pincode)
+                doc_updateobj.doc_address = data.get("doc_address", doc_updateobj.doc_address)
+                doc_updateobj.doc_exprience = data.get("doc_exprience", doc_updateobj.doc_exprience)
+                doc_updateobj.doc_gender = data.get("doc_gender", doc_updateobj.doc_gender)
+                doc_updateobj.speciality = data.get("speciality", doc_updateobj.speciality)
+                doc_updateobj.joining_date = data.get("joining_date", doc_updateobj.joining_date)
+                doc_updateobj.doc_licence_no = data.get("doc_licence_no", doc_updateobj.doc_licence_no)
+                doc_updateobj.doc_city = data.get("doc_city", doc_updateobj.doc_city)
+                doc_updateobj.doc_state = data.get("doc_state", doc_updateobj.doc_state)
+                doc_updateobj.doc_country = data.get("doc_country", doc_updateobj.doc_country)
+                doc_updateobj.doc_pincode = data.get("doc_pincode", doc_updateobj.doc_pincode)
                 doc_updateobj.save()
                 return Response(
                     {"message": "Doctor Profile Updated successfully"},
@@ -2527,7 +2579,6 @@ class DoctorProfileList(APIView):
 
     def get(self, request):
         doctor_profiles = DoctorProfile.objects.all()
-        print("dddd")
         serializer = DoctorProfileViewSlr(doctor_profiles, many=True, context={'request': request})
         return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -2536,196 +2587,119 @@ class PatientProfileCreateUpdate(APIView):
     # authentication_classes = [TokenAuthentication]
     # permission_classes = [IsAuthenticated]
     
-    def post(self,request):
+    def post(self, request):
         update_data = request.data.get("patientprofile_data")
         if not update_data:
             return Response({"error": "patientprofile_data is mandatory"}, status=status.HTTP_400_BAD_REQUEST)
         
-        # If user_update_data is a JSON string, parse it
-        if isinstance(update_data, str):
-            import json
-            try:
-                data = json.loads(update_data)
-            except Exception:
-                return Response({"error": "Invalid JSON format patientprofile_data"}, status=status.HTTP_400_BAD_REQUEST)
+        data, parse_err = _parse_json_payload(update_data)
+        if parse_err:
+            return Response({"error": f"{parse_err} patientprofile_data"}, status=status.HTTP_400_BAD_REQUEST)
 
         medication_data = request.data.get("medication")
         if medication_data:
-        
-            # If user_update_data is a JSON string, parse it
-            if isinstance(medication_data, str):
-                import json
-                try:
-                    medication = json.loads(medication_data)
-                except Exception:
-                    return Response({"error": "Invalid JSON format medication"}, status=status.HTTP_400_BAD_REQUEST)
+            medication, med_err = _parse_json_payload(medication_data)
+            if med_err:
+                return Response({"error": f"{med_err} medication"}, status=status.HTTP_400_BAD_REQUEST)
         else:
-            medication=None
+            medication = None
         
-        sponsorobj=None
+        sponsorobj = None
         sponsorid = data.get("sponsorid")
         if sponsorid:
             try:
-                sponsorobj= SponsorProfile.objects.get(id=sponsorid)
+                sponsorobj = SponsorProfile.objects.get(id=sponsorid)
             except SponsorProfile.DoesNotExist:
                 return Response({"error": "Give me a valid SponsorProfile"}, status=status.HTTP_404_NOT_FOUND)
-
         else:
             return Response({"error": "Give me a SponsorProfile"}, status=status.HTTP_404_NOT_FOUND)
 
-    
-        # doctorobj=None
-        # doctorid = data.get("doctorid")
-        # if doctorid:
-        #     try:
-        #         doctorobj= DoctorProfile.objects.get(id=doctorid)
-        #     except DoctorProfile.DoesNotExist:
-        #         return Response({"error": "Give me a valid DoctoProfile"}, status=status.HTTP_404_NOT_FOUND)
-    
-        caretakerobj=None
+        caretakerobj = None
         caretakerid = data.get("caretakerid")
         if caretakerid:
             try:
-                caretakerobj= CareTakerProfile.objects.get(id=caretakerid)
+                caretakerobj = CareTakerProfile.objects.get(id=caretakerid)
             except CareTakerProfile.DoesNotExist:
                 return Response({"error": "Give me a valid CareTakerProfile"}, status=status.HTTP_404_NOT_FOUND)
         
-        country_code_obj=None
-        phonewithcountrycode=None
+        country_code_obj = None
+        dialcode = None
         country_code = data.get("country_code")
         if country_code:
-            phone = data.get("phone")
-            if phone: 
-                try:
-                    country_code_obj = VerimedCountryCode.objects.get(code=country_code)
-                    dialcode = country_code_obj.dial_code
-                    phonewithcountrycode = f"{dialcode}-{phone}"
-                except VerimedCountryCode.DoesNotExist:
-                    return Response(
-                        {"error": "Invalid country_code"},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-               
+            try:
+                country_code_obj = VerimedCountryCode.objects.get(code=country_code)
+                dialcode = country_code_obj.dial_code
+            except VerimedCountryCode.DoesNotExist:
+                return Response(
+                    {"error": "Invalid country_code"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        phonewithcountrycode = _format_phone_with_dial(dialcode, data.get("phone"))
     
-        print("phonewithcountrycode",phonewithcountrycode)
-        emer_con_country_code_obj=None
-        emer_con_phonewithcountrycode=None
+        emer_con_country_code_obj = None
+        emer_dialcode = None
         emer_con_country_code = data.get("emer_con_country_code")
         if emer_con_country_code:
-            emer_con_phone = data.get("emer_con_phone")
-            if emer_con_phone: 
-                try:
-                    emer_con_country_code_obj = VerimedCountryCode.objects.get(code=emer_con_country_code)
-                    dialcode = emer_con_country_code_obj.dial_code
-                    emer_con_phonewithcountrycode = f"{dialcode}-{emer_con_phone}"
-                except VerimedCountryCode.DoesNotExist:
-                    return Response(
-                        {"error": "Invalid emer_con_country_code"},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
+            try:
+                emer_con_country_code_obj = VerimedCountryCode.objects.get(code=emer_con_country_code)
+                emer_dialcode = emer_con_country_code_obj.dial_code
+            except VerimedCountryCode.DoesNotExist:
+                return Response(
+                    {"error": "Invalid emer_con_country_code"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        emer_con_phonewithcountrycode = _format_phone_with_dial(
+            emer_dialcode, data.get("emer_con_phone")
+        )
         
-        print("emer_con_phonewithcountrycode",emer_con_phonewithcountrycode)
-        local_con_country_code_obj=None
-        local_con_phonewithcountrycode=None
+        local_con_country_code_obj = None
+        local_dialcode = None
         local_con_country_code = data.get("local_con_country_code")
         if local_con_country_code:
-            local_con_phone = data.get("local_con_phone")
-            if local_con_phone: 
-                try:
-                    local_con_country_code_obj = VerimedCountryCode.objects.get(code=emer_con_country_code)
-                    dialcode = local_con_country_code_obj.dial_code
-                    local_con_phonewithcountrycode = f"{dialcode}-{local_con_phone}"
-                except VerimedCountryCode.DoesNotExist:
-                    return Response(
-                        {"error": "Invalid local_con_country_code"},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
+            try:
+                local_con_country_code_obj = VerimedCountryCode.objects.get(code=local_con_country_code)
+                local_dialcode = local_con_country_code_obj.dial_code
+            except VerimedCountryCode.DoesNotExist:
+                return Response(
+                    {"error": "Invalid local_con_country_code"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        local_con_phonewithcountrycode = _format_phone_with_dial(
+            local_dialcode, data.get("local_con_phone")
+        )
                     
         # Step 4: Handle uploaded files
         upload_files = list(request.FILES.getlist("patient_upload_files"))
-        # upload_files_ids = list(request.data.getlist("patient_files_ids"))
-        upload_files_name = list(request.data.getlist("patient_files_name"))
-        print("upload_files_name")
+        cleaned_upload_files_name = _extract_str_list(request.data, "patient_files_name")
         
-        if upload_files or upload_files_name:
-            print("upload_files",upload_files)
-            # print("upload_files_ids",upload_files_ids)
-            print("upload_files_name",upload_files_name)
-            print(len(upload_files))
-            # print(len(upload_files_ids))
-            
-        # --- Normalize upload_files_ids ---
-            # Handle case where input is like ['1,2,null']
-            # if len(upload_files_ids) == 1 and "," in upload_files_ids[0]:
-            #     upload_files_ids = upload_files_ids[0].split(",")
-
-            # # Clean up invalid or placeholder values
-            # cleaned_upload_files_ids = []
-            # for val in upload_files_ids:
-            #     if val and val.lower() not in ["null", "none", ""]:
-            #         try:
-            #             cleaned_upload_files_ids.append(int(val))
-            #         except ValueError:
-            #             cleaned_upload_files_ids.append(None)
-            #     else:
-            #         cleaned_upload_files_ids.append(None)
-                    
-            # print("cleaned_upload_files_ids",cleaned_upload_files_ids)
-
-            # --- Normalize upload_files_name ---
-            # Handle case where input is like ['1,2,null']
-            if len(upload_files_name) == 1 and "," in upload_files_name[0]:
-                upload_files_name = upload_files_name[0].split(",")
-
-            # Clean up invalid or placeholder values
-            cleaned_upload_files_name = []
-            
-            for val in upload_files_name:
-                    
-                    cleaned_upload_files_name.append(val)
-                    
-            print("cleaned_upload_failes_name",cleaned_upload_files_name)
-            
-            if not (len(upload_files) == len(cleaned_upload_files_name)):
+        if upload_files or cleaned_upload_files_name:
+            if len(upload_files) != len(cleaned_upload_files_name):
                 return Response(
-                    
-                     {
-            "error": (
-                f"Mismatch in counts: upload_files ({len(upload_files)}), "
-                # f"patient_files_ids ({len(cleaned_upload_files_ids)}), "
-                f"patient_files_name ({len(cleaned_upload_files_name)})"
-            )
-        },
-        status=status.HTTP_400_BAD_REQUEST
+                    {
+                        "error": (
+                            f"Mismatch in counts: upload_files ({len(upload_files)}), "
+                            f"patient_files_name ({len(cleaned_upload_files_name)})"
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
                 )
         
-        
-        photo = request.data.get("patient_photo",None)
-        if photo:
-            photo=photo
-        print("hii")    
+        photo = request.data.get("patient_photo", None)
 
-    
         try:
             with transaction.atomic():
-                patient_profile=PatientProfile.objects.create(
-                    
+                patient_profile = PatientProfile.objects.create(
                     sponsor=sponsorobj,
                     caretaker=caretakerobj,
                     country_code=country_code_obj,
                     phone=phonewithcountrycode,
                     photo=photo,
-                    
-                        
-                    emer_con_country_code = emer_con_country_code_obj,
-                    emer_con_phone = emer_con_phonewithcountrycode,
-                    
-                    local_con_country_code = local_con_country_code_obj,
-                    local_con_phone = local_con_phonewithcountrycode,
-
+                    emer_con_country_code=emer_con_country_code_obj,
+                    emer_con_phone=emer_con_phonewithcountrycode,
+                    local_con_country_code=local_con_country_code_obj,
+                    local_con_phone=local_con_phonewithcountrycode,
                     email=data.get("email") or None,
                     age=data.get("age"),
-                    # 
                     height=data.get("height") or None,
                     weight=data.get("weight") or None,
                     blood_pressure=data.get("blood_pressure") or None,
@@ -2734,7 +2708,6 @@ class PatientProfileCreateUpdate(APIView):
                     oxygen=data.get("oxygen") or None,
                     temperature=data.get("temperature") or None,
                     respiratory_rate=data.get("respiratory_rate") or None,
-                    
                     patient_name=data.get("patient_name") or None,
                     patient_dob=data.get("patient_dob") or None,
                     patient_gender=data.get("patient_gender") or None,
@@ -2743,44 +2716,24 @@ class PatientProfileCreateUpdate(APIView):
                     primary_language=data.get("primary_language") or None,
                     religion=data.get("religion") or None,
                     escalate_to_physician=data.get("escalate_to_physician") or None,
-                    
-                    # Emergency Contact
-                    emer_con_name=data.get("emer_con_name")or None,
+                    emer_con_name=data.get("emer_con_name") or None,
                     emer_con_relation=data.get("emer_con_relation") or None,
                     emer_con_coun_of_residen=data.get("emer_con_coun_of_residen") or None,
                     emer_con_email=data.get("emer_con_email") or None,
-                    
                     local_con_name=data.get("local_con_name") or None,
                     local_con_relation=data.get("local_con_relation") or None,
-
-                    
-                    # Reason for Enrollment
                     reason_enrollment=data.get("reason_enrollment") or None,
                     reason_other=data.get("reason_other") or None,
-                    
-                    # Medical History
                     medical_his_diagnosis=data.get("medical_his_diagnosis") or None,
                     medical_his_cancer=data.get("medical_his_cancer") or None,
                     medical_his_other=data.get("medical_his_other") or None,
                     medical_his_provided_medi_care=data.get("medical_his_provided_medi_care") or None,
                     medical_his_major_surgeries=data.get("medical_his_major_surgeries") or None,
                     medical_his_curr_symp=data.get("medical_his_curr_symp") or None,
-                    
-                    # Medication
                     medication=medication,
-                    # medication_name=data.get("medication_name"),
-                    # medication_dose=data.get("medication_dose"),
-                    # medication_frequency=data.get("medication_frequency"),
-                    # medication_reason=data.get("medication_reason"),
-                    # medication_issues=data.get("medication_issues"),
-                    # medication_issues_explain=data.get("reasomedication_issues_explainn_other"),
-                    
-                    # Allergies
                     allergies_issues=data.get("allergies_issues") or False,
                     allergies_drug=data.get("allergies_drug") or None,
                     allergies_food=data.get("allergies_food") or None,
-                    
-                    # Functional Abilities
                     functional_bathe=data.get("functional_bathe") or None,
                     functional_dress=data.get("functional_dress") or None,
                     functional_eat=data.get("functional_eat") or None,
@@ -2791,8 +2744,6 @@ class PatientProfileCreateUpdate(APIView):
                     functional_any_falls=data.get("functional_any_falls") or False,
                     functional_how_many=data.get("functional_how_many") or None,
                     functional_memory_pbms=data.get("functional_memory_pbms") or False,
-                    
-                    # Lifestyle
                     lifestyle_daily_routine=data.get("lifestyle_daily_routine") or None,
                     lifestyle_dietary_habits=data.get("lifestyle_dietary_habits") or None,
                     lifestyle_sleep_quality=data.get("lifestyle_sleep_quality") or None,
@@ -2800,35 +2751,35 @@ class PatientProfileCreateUpdate(APIView):
                     lifestyle_alcohol_use=data.get("lifestyle_alcohol_use") or None,
                     lifestyle_pain_complaints=data.get("lifestyle_pain_complaints") or None,
                     lifestyle_pain_where=data.get("lifestyle_pain_where") or None,
-                    
-                    # Social and Emotional
                     social_emotion_health=data.get("social_emotion_health") or None,
                     social_spiritual_needs=data.get("social_spiritual_needs") or None,
                     social_trusted_person=data.get("social_trusted_person") or False,
                     social_name=data.get("social_name") or None,
-                    
-                    # Goals
                     goals_family_hope=data.get("goals_family_hope") or None,
                     goals_special_instructions=data.get("goals_special_instructions") or None,
-                    goals_term_membership=data.get("goals_term_membership") or None
-                    )
+                    goals_term_membership=data.get("goals_term_membership") or None,
+                )
                 
                 patient_profile.save()
                 
                 if upload_files:
-                    # --- Handle lab reports (update or create) ---
                     for index, file_obj in enumerate(upload_files):
-                        # report_id = cleaned_upload_files_ids[index]
                         file_name = cleaned_upload_files_name[index]
-
                         PatientUploadDocuments.objects.create(
                             patient_profile=patient_profile,
                             file=file_obj,
-                            filename=file_name,  # optional if model supports this field
+                            filename=file_name,
                             referid=patient_profile.id
                         )
                         
-                sponsorname=sponsorobj.user.first_name
+                sponsor_user = getattr(sponsorobj, "user", None)
+                sponsorname = (
+                    (getattr(sponsor_user, "first_name", None) or "").strip()
+                    or (getattr(sponsor_user, "username", None) or "").strip()
+                    or "Valued Family Member"
+                )
+                sponsoremail = (getattr(sponsor_user, "email", None) or "").strip()
+
                 from django.core.mail import EmailMessage
                 from django.conf import settings
                 portal_url = getattr(
@@ -2837,8 +2788,10 @@ class PatientProfileCreateUpdate(APIView):
                     "https://verimed-fe.vercel.app/",
                 )
 
-                
-                def send_api_verticalcontact_mail(sponsorname):
+                def send_api_verticalcontact_mail(sponsorname, sponsoremail):
+                    if not sponsoremail:
+                        return False
+
                     subject = "Welcome to VeriMED — Your Premium Care Journey Begins Here"
 
                     message = f"""
@@ -2890,16 +2843,11 @@ class PatientProfileCreateUpdate(APIView):
                     """
 
                     from_email = settings.DEFAULT_FROM_EMAIL
-                    
-                    # ✅ Add three recipient emails
-                    sponsoremail = sponsorobj.user.email
-
                     recipient_list = [sponsoremail]
 
-                    
                     try:
                         email_msg = EmailMessage(subject, "", from_email, recipient_list)
-                        email_msg.content_subtype = "html"  # VERY IMPORTANT
+                        email_msg.content_subtype = "html"
                         email_msg.body = message
                         email_msg.send(fail_silently=False)
                         print("Appoinment Booking email sent successfully")
@@ -2908,14 +2856,12 @@ class PatientProfileCreateUpdate(APIView):
                         print(f"Error sending vertical contact email: {e}")
                         return False
                     
-                send_api_verticalcontact_mail(sponsorname)
-                
+                send_api_verticalcontact_mail(sponsorname, sponsoremail)
 
                 return Response(
                     {"message": "Patient Profile Created successfully"},
                     status=status.HTTP_200_OK
                 )
-                
                 
         except Exception as e:
             return Response(
@@ -2923,303 +2869,248 @@ class PatientProfileCreateUpdate(APIView):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
              
-    def patch(self,request):
+    def patch(self, request):
         update_data = request.data.get("patientprofile_update_data")
         if not update_data:
             return Response({"error": "data is mandatory"}, status=status.HTTP_400_BAD_REQUEST)
         
-        # If user_update_data is a JSON string, parse it
-        if isinstance(update_data, str):
-            import json
-            try:
-                data = json.loads(update_data)
-            except Exception:
-                return Response({"error": "Invalid JSON format"}, status=status.HTTP_400_BAD_REQUEST)
+        data, parse_err = _parse_json_payload(update_data)
+        if parse_err:
+            return Response({"error": parse_err}, status=status.HTTP_400_BAD_REQUEST)
 
         medication_data = request.data.get("medication")
         if medication_data:
-        
-            # If user_update_data is a JSON string, parse it
-            if isinstance(medication_data, str):
-                import json
-                try:
-                    medication = json.loads(medication_data)
-                except Exception:
-                    return Response({"error": "Invalid JSON format medication"}, status=status.HTTP_400_BAD_REQUEST)
+            medication, med_err = _parse_json_payload(medication_data)
+            if med_err:
+                return Response({"error": f"{med_err} medication"}, status=status.HTTP_400_BAD_REQUEST)
         else:
-            medication=None
+            medication = None
         
         try:
-            patient_updateobj= PatientProfile.objects.get(id=data.get("patient_profile_updateid"))
+            patient_updateobj = PatientProfile.objects.get(id=data.get("patient_profile_updateid"))
         except PatientProfile.DoesNotExist:
             return Response({"error": "Give me a valid PatientProfile"}, status=status.HTTP_404_NOT_FOUND)
         
-        sponsorobj=None
+        sponsorobj = None
         sponsorid = data.get("sponsorid")
         if sponsorid:
             try:
-                sponsorobj= SponsorProfile.objects.get(id=sponsorid)
+                sponsorobj = SponsorProfile.objects.get(id=sponsorid)
             except SponsorProfile.DoesNotExist:
                 return Response({"error": "Give me a valid SponsorProfile"}, status=status.HTTP_404_NOT_FOUND)
-            
-        else:
-            return Response({"error": "Give me a SponsorProfile"}, status=status.HTTP_404_NOT_FOUND)
-
     
-    
-        # doctorobj=None
-        # doctorid = data.get("doctorid")
-        # if doctorid:
-        #     try:
-        #         doctorobj= DoctorProfile.objects.get(id=doctorid)
-        #     except DoctorProfile.DoesNotExist:
-        #         return Response({"error": "Give me a valid DoctoProfile"}, status=status.HTTP_404_NOT_FOUND)
-    
-        caretakerobj=None
-        phonewithcountrycode=None
-        caretakerid = data.get("caretakerid")
-        if caretakerid:
-            try:
-                caretakerobj= CareTakerProfile.objects.get(id=caretakerid)
-            except CareTakerProfile.DoesNotExist:
-                return Response({"error": "Give me a valid CareTakerProfile"}, status=status.HTTP_404_NOT_FOUND)
+        has_caretakerid = "caretakerid" in data
+        caretakerobj = patient_updateobj.caretaker
+        if has_caretakerid:
+            caretakerid = data.get("caretakerid")
+            if caretakerid:
+                try:
+                    caretakerobj = CareTakerProfile.objects.get(id=caretakerid)
+                except CareTakerProfile.DoesNotExist:
+                    return Response({"error": "Give me a valid CareTakerProfile"}, status=status.HTTP_404_NOT_FOUND)
+            else:
+                caretakerobj = None
         
-        country_code_obj=None
-        country_code = data.get("country_code")
-        if country_code:
-            phone = data.get("phone")
-            if phone: 
+        has_country_code = "country_code" in data
+        if has_country_code:
+            country_code = data.get("country_code")
+            if country_code:
                 try:
                     country_code_obj = VerimedCountryCode.objects.get(code=country_code)
                     dialcode = country_code_obj.dial_code
-                    phonewithcountrycode = f"{dialcode}-{phone}"
                 except VerimedCountryCode.DoesNotExist:
                     return Response(
                         {"error": "Invalid country_code"},
                         status=status.HTTP_400_BAD_REQUEST
                     )
+            else:
+                country_code_obj = None
+                dialcode = None
+        else:
+            country_code_obj = patient_updateobj.country_code
+            dialcode = country_code_obj.dial_code if country_code_obj else None
+
+        has_phone = "phone" in data
+        if has_phone:
+            phonewithcountrycode = _format_phone_with_dial(dialcode, data.get("phone"))
         
-        
-        emer_con_country_code_obj=None
-        emer_con_phonewithcountrycode=None
-        emer_con_country_code = data.get("emer_con_country_code")
-        if emer_con_country_code:
-            emer_con_phone = data.get("emer_con_phone")
-            if emer_con_phone: 
+        has_emer_cc = "emer_con_country_code" in data
+        if has_emer_cc:
+            emer_con_country_code = data.get("emer_con_country_code")
+            if emer_con_country_code:
                 try:
                     emer_con_country_code_obj = VerimedCountryCode.objects.get(code=emer_con_country_code)
-                    dialcode = emer_con_country_code_obj.dial_code
-                    emer_con_phonewithcountrycode = f"{dialcode}-{emer_con_phone}"
+                    emer_dialcode = emer_con_country_code_obj.dial_code
                 except VerimedCountryCode.DoesNotExist:
                     return Response(
                         {"error": "Invalid emer_con_country_code"},
                         status=status.HTTP_400_BAD_REQUEST
                     )
+            else:
+                emer_con_country_code_obj = None
+                emer_dialcode = None
+        else:
+            emer_con_country_code_obj = patient_updateobj.emer_con_country_code
+            emer_dialcode = emer_con_country_code_obj.dial_code if emer_con_country_code_obj else None
+
+        has_emer_phone = "emer_con_phone" in data
+        if has_emer_phone:
+            emer_con_phonewithcountrycode = _format_phone_with_dial(
+                emer_dialcode, data.get("emer_con_phone")
+            )
                     
-        local_con_country_code_obj=None
-        local_con_phonewithcountrycode=None
-        local_con_country_code = data.get("local_con_country_code")
-        if local_con_country_code:
-            local_con_phone = data.get("local_con_phone")
-            if local_con_phone: 
+        has_local_cc = "local_con_country_code" in data
+        if has_local_cc:
+            local_con_country_code = data.get("local_con_country_code")
+            if local_con_country_code:
                 try:
-                    local_con_country_code_obj = VerimedCountryCode.objects.get(code=emer_con_country_code)
-                    dialcode = local_con_country_code_obj.dial_code
-                    local_con_phonewithcountrycode = f"{dialcode}-{local_con_phone}"
+                    local_con_country_code_obj = VerimedCountryCode.objects.get(code=local_con_country_code)
+                    local_dialcode = local_con_country_code_obj.dial_code
                 except VerimedCountryCode.DoesNotExist:
                     return Response(
                         {"error": "Invalid local_con_country_code"},
                         status=status.HTTP_400_BAD_REQUEST
                     )
+            else:
+                local_con_country_code_obj = None
+                local_dialcode = None
+        else:
+            local_con_country_code_obj = patient_updateobj.local_con_country_code
+            local_dialcode = local_con_country_code_obj.dial_code if local_con_country_code_obj else None
+
+        has_local_phone = "local_con_phone" in data
+        if has_local_phone:
+            local_con_phonewithcountrycode = _format_phone_with_dial(
+                local_dialcode, data.get("local_con_phone")
+            )
                     
         # Step 4: Handle uploaded files
         upload_files = list(request.FILES.getlist("patient_upload_files"))
-        upload_files_ids = list(request.data.getlist("patient_files_ids"))
-        upload_files_name = list(request.data.getlist("patient_files_name"))
+        upload_files_ids = _extract_str_list(request.data, "patient_files_ids")
+        cleaned_upload_files_name = _extract_str_list(request.data, "patient_files_name")
         
-        if upload_files or upload_files_name or upload_files_name:
-            print("upload_files",upload_files)
-            print("upload_files_ids",upload_files_ids)
-            print("upload_files_name",upload_files_name)
-            print(len(upload_files))
-            print(len(upload_files_ids))
-            
-        # --- Normalize upload_files_ids ---
-            # Handle case where input is like ['1,2,null']
-            if len(upload_files_ids) == 1 and "," in upload_files_ids[0]:
-                upload_files_ids = upload_files_ids[0].split(",")
-
-            # Clean up invalid or placeholder values
+        if upload_files or upload_files_ids or cleaned_upload_files_name:
             cleaned_upload_files_ids = []
             for val in upload_files_ids:
-                if val and val.lower() not in ["null", "none", ""]:
+                val_str = str(val).strip() if val is not None else ""
+                if val_str and val_str.lower() not in ["null", "none", ""]:
                     try:
-                        cleaned_upload_files_ids.append(int(val))
+                        cleaned_upload_files_ids.append(int(val_str))
                     except ValueError:
                         cleaned_upload_files_ids.append(None)
                 else:
                     cleaned_upload_files_ids.append(None)
-                    
-            print("cleaned_upload_files_ids",cleaned_upload_files_ids)
-
-            # --- Normalize upload_files_name ---
-            # Handle case where input is like ['1,2,null']
-            if len(upload_files_name) == 1 and "," in upload_files_name[0]:
-                upload_files_name = upload_files_name[0].split(",")
-
-            # Clean up invalid or placeholder values
-            cleaned_upload_files_name = []
-            
-            for val in upload_files_name:
-                    
-                    cleaned_upload_files_name.append(val)
-                    
-            print("cleaned_upload_files_name",cleaned_upload_files_name)
             
             if not (len(upload_files) == len(cleaned_upload_files_ids) == len(cleaned_upload_files_name)):
                 return Response(
-                    
-                     {
-            "error": (
-                f"Mismatch in counts: upload_files ({len(upload_files)}), "
-                f"patient_files_ids ({len(cleaned_upload_files_ids)}), "
-                f"patient_files_name ({len(cleaned_upload_files_name)})"
-            )
-        },
-        status=status.HTTP_400_BAD_REQUEST
+                    {
+                        "error": (
+                            f"Mismatch in counts: upload_files ({len(upload_files)}), "
+                            f"patient_files_ids ({len(cleaned_upload_files_ids)}), "
+                            f"patient_files_name ({len(cleaned_upload_files_name)})"
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
                 )
         
-        photo = request.data.get("patient_photo",None)
+        photo = request.data.get("patient_photo", None)
 
-        # print(ddddddddddd)
         try:
             with transaction.atomic():
                 if sponsorobj:
                     patient_updateobj.sponsor = sponsorobj
-                    
-                # if doctorobj:
-                #     patient_updateobj.doctor = doctorobj
-                    
-                if caretakerobj:
+                if has_caretakerid:
                     patient_updateobj.caretaker = caretakerobj
-                
-                if country_code_obj:
+                if has_country_code:
                     patient_updateobj.country_code = country_code_obj
+                if has_phone:
                     patient_updateobj.phone = phonewithcountrycode
-                # else:
-                #     patient_updateobj.emer_con_phone = data.get("emer_con_phone", patient_updateobj.emer_con_phone)
-                
-                
-                if emer_con_country_code_obj:
+                if has_emer_cc:
                     patient_updateobj.emer_con_country_code = emer_con_country_code_obj
+                if has_emer_phone:
                     patient_updateobj.emer_con_phone = emer_con_phonewithcountrycode
-                # else:
-                #     patient_updateobj.emer_con_phone = data.get("emer_con_phone", patient_updateobj.emer_con_phone)
-                
-                
-                if local_con_country_code_obj:
+                if has_local_cc:
                     patient_updateobj.local_con_country_code = local_con_country_code_obj
+                if has_local_phone:
                     patient_updateobj.local_con_phone = local_con_phonewithcountrycode
-                # else:
-                #     patient_updateobj.local_con_phone = data.get("local_con_phone", patient_updateobj.local_con_phone)
                 if photo:
-                    patient_updateobj.photo=photo  
+                    patient_updateobj.photo = photo
                     
-                patient_updateobj.email=data.get("email",patient_updateobj.email)
-                patient_updateobj.age=data.get("age",patient_updateobj.age)
-                # 
-                patient_updateobj.height=data.get("height",patient_updateobj.height)
-                patient_updateobj.weight=data.get("weight",patient_updateobj.weight)
-                patient_updateobj.blood_pressure=data.get("blood_pressure",patient_updateobj.blood_pressure)
-                patient_updateobj.blood_sugar=data.get("blood_sugar",patient_updateobj.blood_sugar)
-                patient_updateobj.heart_rate=data.get("heart_rate",patient_updateobj.heart_rate)
-                patient_updateobj.oxygen=data.get("oxygen",patient_updateobj.oxygen)
-                patient_updateobj.temperature=data.get("temperature",patient_updateobj.temperature)
-                patient_updateobj.respiratory_rate=data.get("respiratory_rate",patient_updateobj.respiratory_rate)
-                       
+                patient_updateobj.email = data.get("email", patient_updateobj.email)
+                patient_updateobj.age = data.get("age", patient_updateobj.age)
+                patient_updateobj.height = data.get("height", patient_updateobj.height)
+                patient_updateobj.weight = data.get("weight", patient_updateobj.weight)
+                patient_updateobj.blood_pressure = data.get("blood_pressure", patient_updateobj.blood_pressure)
+                patient_updateobj.blood_sugar = data.get("blood_sugar", patient_updateobj.blood_sugar)
+                patient_updateobj.heart_rate = data.get("heart_rate", patient_updateobj.heart_rate)
+                patient_updateobj.oxygen = data.get("oxygen", patient_updateobj.oxygen)
+                patient_updateobj.temperature = data.get("temperature", patient_updateobj.temperature)
+                patient_updateobj.respiratory_rate = data.get("respiratory_rate", patient_updateobj.respiratory_rate)
                      
-                patient_updateobj.patient_name=data.get("patient_name",patient_updateobj.patient_name)
-                patient_updateobj.patient_dob=data.get("patient_dob",patient_updateobj.patient_dob)
-                patient_updateobj.patient_gender=data.get("patient_gender",patient_updateobj.patient_gender)
-                patient_updateobj.blood_group=data.get("blood_group",patient_updateobj.blood_group)
-                patient_updateobj.patient_home_address=data.get("patient_home_address",patient_updateobj.patient_home_address)
-                patient_updateobj.primary_language=data.get("primary_language",patient_updateobj.primary_language)
-                patient_updateobj.religion=data.get("religion",patient_updateobj.religion)
-                patient_updateobj.escalate_to_physician=data.get("escalate_to_physician",patient_updateobj.escalate_to_physician)
+                patient_updateobj.patient_name = data.get("patient_name", patient_updateobj.patient_name)
+                patient_updateobj.patient_dob = data.get("patient_dob", patient_updateobj.patient_dob)
+                patient_updateobj.patient_gender = data.get("patient_gender", patient_updateobj.patient_gender)
+                patient_updateobj.blood_group = data.get("blood_group", patient_updateobj.blood_group)
+                patient_updateobj.patient_home_address = data.get("patient_home_address", patient_updateobj.patient_home_address)
+                patient_updateobj.primary_language = data.get("primary_language", patient_updateobj.primary_language)
+                patient_updateobj.religion = data.get("religion", patient_updateobj.religion)
+                patient_updateobj.escalate_to_physician = data.get("escalate_to_physician", patient_updateobj.escalate_to_physician)
                 
-                # Emergency Contact
-                patient_updateobj.emer_con_name=data.get("emer_con_name",patient_updateobj.emer_con_name)
-                patient_updateobj.emer_con_relation=data.get("emer_con_relation",patient_updateobj.emer_con_relation)
-                patient_updateobj.emer_con_coun_of_residen=data.get("emer_con_coun_of_residen",patient_updateobj.emer_con_coun_of_residen)
-                patient_updateobj.emer_con_email=data.get("emer_con_email",patient_updateobj.emer_con_email)
+                patient_updateobj.emer_con_name = data.get("emer_con_name", patient_updateobj.emer_con_name)
+                patient_updateobj.emer_con_relation = data.get("emer_con_relation", patient_updateobj.emer_con_relation)
+                patient_updateobj.emer_con_coun_of_residen = data.get("emer_con_coun_of_residen", patient_updateobj.emer_con_coun_of_residen)
+                patient_updateobj.emer_con_email = data.get("emer_con_email", patient_updateobj.emer_con_email)
                 
-                patient_updateobj.local_con_name=data.get("local_con_name",patient_updateobj.local_con_name)
-                patient_updateobj.local_con_relation=data.get("local_con_relation",patient_updateobj.local_con_relation)
-
+                patient_updateobj.local_con_name = data.get("local_con_name", patient_updateobj.local_con_name)
+                patient_updateobj.local_con_relation = data.get("local_con_relation", patient_updateobj.local_con_relation)
                 
-                # Reason for Enrollment
-                patient_updateobj.reason_enrollment=data.get("reason_enrollment",patient_updateobj.reason_enrollment)
-                patient_updateobj.reason_other=data.get("reason_other",patient_updateobj.reason_other)
+                patient_updateobj.reason_enrollment = data.get("reason_enrollment", patient_updateobj.reason_enrollment)
+                patient_updateobj.reason_other = data.get("reason_other", patient_updateobj.reason_other)
                 
-                # Medical History
-                patient_updateobj.medical_his_diagnosis=data.get("medical_his_diagnosis",patient_updateobj.medical_his_diagnosis)
-                patient_updateobj.medical_his_cancer=data.get("medical_his_cancer",patient_updateobj.medical_his_cancer)
-                patient_updateobj.medical_his_other=data.get("medical_his_other",patient_updateobj.medical_his_other)
-                patient_updateobj.medical_his_provided_medi_care=data.get("medical_his_provided_medi_care",patient_updateobj.medical_his_provided_medi_care)
-                patient_updateobj.medical_his_major_surgeries=data.get("medical_his_major_surgeries",patient_updateobj.medical_his_major_surgeries)
-                patient_updateobj.medical_his_curr_symp=data.get("medical_his_curr_symp",patient_updateobj.medical_his_curr_symp)
+                patient_updateobj.medical_his_diagnosis = data.get("medical_his_diagnosis", patient_updateobj.medical_his_diagnosis)
+                patient_updateobj.medical_his_cancer = data.get("medical_his_cancer", patient_updateobj.medical_his_cancer)
+                patient_updateobj.medical_his_other = data.get("medical_his_other", patient_updateobj.medical_his_other)
+                patient_updateobj.medical_his_provided_medi_care = data.get("medical_his_provided_medi_care", patient_updateobj.medical_his_provided_medi_care)
+                patient_updateobj.medical_his_major_surgeries = data.get("medical_his_major_surgeries", patient_updateobj.medical_his_major_surgeries)
+                patient_updateobj.medical_his_curr_symp = data.get("medical_his_curr_symp", patient_updateobj.medical_his_curr_symp)
                 
-                # Medication
+                patient_updateobj.medication = medication or patient_updateobj.medication
                 
-                patient_updateobj.medication=medication or patient_updateobj.medication
-                # patient_updateobj.medication_name=data.get("medication_name",patient_updateobj.medication_name)
-                # patient_updateobj.medication_dose=data.get("medication_dose",patient_updateobj.medication_dose)
-                # patient_updateobj.medication_frequency=data.get("medication_frequency",patient_updateobj.medication_frequency)
-                # patient_updateobj.medication_reason=data.get("medication_reason",patient_updateobj.medication_reason)
-                # patient_updateobj.medication_issues=data.get("medication_issues",patient_updateobj.medication_issues)
-                # patient_updateobj.medication_issues_explain=data.get("reasomedication_issues_explainn_other",patient_updateobj.medication_issues_explain)
+                patient_updateobj.allergies_issues = data.get("allergies_issues", patient_updateobj.allergies_issues)
+                patient_updateobj.allergies_drug = data.get("allergies_drug", patient_updateobj.allergies_drug)
+                patient_updateobj.allergies_food = data.get("allergies_food", patient_updateobj.allergies_food)
                 
-                # Allergies
-                patient_updateobj.allergies_issues=data.get("allergies_issues",patient_updateobj.allergies_issues)
-                patient_updateobj.allergies_drug=data.get("allergies_drug",patient_updateobj.allergies_drug)
-                patient_updateobj.allergies_food=data.get("allergies_food",patient_updateobj.allergies_food)
+                patient_updateobj.functional_bathe = data.get("functional_bathe", patient_updateobj.functional_bathe)
+                patient_updateobj.functional_dress = data.get("functional_dress", patient_updateobj.functional_dress)
+                patient_updateobj.functional_eat = data.get("functional_eat", patient_updateobj.functional_eat)
+                patient_updateobj.functional_walk = data.get("functional_walk", patient_updateobj.functional_walk)
+                patient_updateobj.functional_use_bathroom = data.get("functional_use_bathroom", patient_updateobj.functional_use_bathroom)
+                patient_updateobj.functional_daily_activity = data.get("functional_daily_activity", patient_updateobj.functional_daily_activity)
+                patient_updateobj.functional_manage_finance = data.get("functional_manage_finance", patient_updateobj.functional_manage_finance)
+                patient_updateobj.functional_any_falls = data.get("functional_any_falls", patient_updateobj.functional_any_falls)
+                patient_updateobj.functional_how_many = data.get("functional_how_many", patient_updateobj.functional_how_many)
+                patient_updateobj.functional_memory_pbms = data.get("functional_memory_pbms", patient_updateobj.functional_memory_pbms)
                 
-                # Functional Abilities
-                patient_updateobj.functional_bathe=data.get("functional_bathe",patient_updateobj.functional_bathe)
-                patient_updateobj.functional_dress=data.get("functional_dress",patient_updateobj.functional_dress)
-                patient_updateobj.functional_eat=data.get("functional_eat",patient_updateobj.functional_eat)
-                patient_updateobj.functional_walk=data.get("functional_walk",patient_updateobj.functional_walk)
-                patient_updateobj.functional_use_bathroom=data.get("functional_use_bathroom",patient_updateobj.functional_use_bathroom)
-                patient_updateobj.functional_daily_activity=data.get("functional_daily_activity",patient_updateobj.functional_daily_activity)
-                patient_updateobj.functional_manage_finance=data.get("functional_manage_finance",patient_updateobj.functional_manage_finance)
-                patient_updateobj.functional_any_falls=data.get("functional_any_falls",patient_updateobj.functional_any_falls)
-                patient_updateobj.functional_how_many=data.get("functional_how_many",patient_updateobj.functional_how_many)
-                patient_updateobj.functional_memory_pbms=data.get("functional_memory_pbms",patient_updateobj.functional_memory_pbms)
+                patient_updateobj.lifestyle_daily_routine = data.get("lifestyle_daily_routine", patient_updateobj.lifestyle_daily_routine)
+                patient_updateobj.lifestyle_dietary_habits = data.get("lifestyle_dietary_habits", patient_updateobj.lifestyle_dietary_habits)
+                patient_updateobj.lifestyle_sleep_quality = data.get("lifestyle_sleep_quality", patient_updateobj.lifestyle_sleep_quality)
+                patient_updateobj.lifestyle_physical_activity = data.get("lifestyle_physical_activity", patient_updateobj.lifestyle_physical_activity)
+                patient_updateobj.lifestyle_alcohol_use = data.get("lifestyle_alcohol_use", patient_updateobj.lifestyle_alcohol_use)
+                patient_updateobj.lifestyle_pain_complaints = data.get("lifestyle_pain_complaints", patient_updateobj.lifestyle_pain_complaints)
+                patient_updateobj.lifestyle_pain_where = data.get("lifestyle_pain_where", patient_updateobj.lifestyle_pain_where)
                 
-                # Lifestyle
-                patient_updateobj.lifestyle_daily_routine=data.get("lifestyle_daily_routine",patient_updateobj.lifestyle_daily_routine)
-                patient_updateobj.lifestyle_dietary_habits=data.get("lifestyle_dietary_habits",patient_updateobj.lifestyle_dietary_habits)
-                patient_updateobj.lifestyle_sleep_quality=data.get("lifestyle_sleep_quality",patient_updateobj.lifestyle_sleep_quality)
-                patient_updateobj.lifestyle_physical_activity=data.get("lifestyle_physical_activity",patient_updateobj.lifestyle_physical_activity)
-                patient_updateobj.lifestyle_alcohol_use=data.get("lifestyle_alcohol_use",patient_updateobj.lifestyle_alcohol_use)
-                patient_updateobj.lifestyle_pain_complaints=data.get("lifestyle_pain_complaints",patient_updateobj.lifestyle_pain_complaints)
-                patient_updateobj.lifestyle_pain_where=data.get("lifestyle_pain_where",patient_updateobj.lifestyle_pain_where)
+                patient_updateobj.social_emotion_health = data.get("social_emotion_health", patient_updateobj.social_emotion_health)
+                patient_updateobj.social_spiritual_needs = data.get("social_spiritual_needs", patient_updateobj.social_spiritual_needs)
+                patient_updateobj.social_trusted_person = data.get("social_trusted_person", patient_updateobj.social_trusted_person)
+                patient_updateobj.social_name = data.get("social_name", patient_updateobj.social_name)
                 
-                # Social and Emotional
-                patient_updateobj.social_emotion_health=data.get("social_emotion_health",patient_updateobj.social_emotion_health)
-                patient_updateobj.social_spiritual_needs=data.get("social_spiritual_needs",patient_updateobj.social_spiritual_needs)
-                patient_updateobj.social_trusted_person=data.get("social_trusted_person",patient_updateobj.social_trusted_person)
-                patient_updateobj.social_name=data.get("social_name",patient_updateobj.social_name)
-                
-                # Goals
-                patient_updateobj.goals_family_hope=data.get("goals_family_hope",patient_updateobj.goals_family_hope)
-                patient_updateobj.goals_special_instructions=data.get("goals_special_instructions",patient_updateobj.goals_special_instructions)
-                patient_updateobj.goals_term_membership=data.get("goals_term_membership",patient_updateobj.goals_term_membership)
+                patient_updateobj.goals_family_hope = data.get("goals_family_hope", patient_updateobj.goals_family_hope)
+                patient_updateobj.goals_special_instructions = data.get("goals_special_instructions", patient_updateobj.goals_special_instructions)
+                patient_updateobj.goals_term_membership = data.get("goals_term_membership", patient_updateobj.goals_term_membership)
                 
                 patient_updateobj.save()
                 
                 if upload_files:
-                    # --- Handle lab reports (update or create) ---
                     for index, file_obj in enumerate(upload_files):
                         report_id = cleaned_upload_files_ids[index]
                         file_name = cleaned_upload_files_name[index]
@@ -3228,7 +3119,7 @@ class PatientProfileCreateUpdate(APIView):
                             try:
                                 report = PatientUploadDocuments.objects.get(id=report_id)
                                 report.file = file_obj
-                                report.filename = file_name or report.filename  # optional: store filename if model has field
+                                report.filename = file_name or report.filename
                                 report.save()
                             except PatientUploadDocuments.DoesNotExist:
                                 raise NotFound(detail=f"Invalid patient upload document ID: {report_id}")
@@ -3236,7 +3127,7 @@ class PatientProfileCreateUpdate(APIView):
                             PatientUploadDocuments.objects.create(
                                 patient_profile=patient_updateobj,
                                 file=file_obj,
-                                filename=file_name,  # optional if model supports this field
+                                filename=file_name,
                                 referid=patient_updateobj.id
                             )
 
@@ -3244,7 +3135,6 @@ class PatientProfileCreateUpdate(APIView):
                     {"message": "Patient Profile Updated successfully"},
                     status=status.HTTP_200_OK
                 )
-                
                 
         except Exception as e:
             return Response(
@@ -3280,7 +3170,9 @@ class PatientProfileList(APIView):
                     verimed_doctor_qs = PatientProfile.objects.filter(sponsor=sponsor_obj)
                 else:
                     verimed_doctor_qs = PatientProfile.objects.all()
-            serializer = PatientProfileViewSlr(verimed_doctor_qs, many=True)
+            serializer = PatientProfileViewSlr(
+                verimed_doctor_qs, many=True, context={"request": request}
+            )
             
             response_data = []
             
@@ -3313,13 +3205,9 @@ class PatientProfileList(APIView):
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
      
     def delete(self,request):
-        # Get list of IDs from request data
-        if hasattr(request.data, "getlist"):
-            patientprofiledeleteids = request.data.get("patientprofiledeleteids")  # form-data
-        else:
-            patientprofiledeleteids = request.data.get("patientprofiledeleteids", [])  # JSON list
+        valid_ids, invalid_format_ids = _extract_id_list(request, "patientprofiledeleteids")
 
-        if not patientprofiledeleteids:
+        if not valid_ids and not invalid_format_ids:
             return Response(
                 {"error": "No Patient Profile Deleted IDs provided."},
                 status=status.HTTP_400_BAD_REQUEST
@@ -3330,9 +3218,9 @@ class PatientProfileList(APIView):
         if sponsor_user and logged_sponsor is None:
             return Response({"error": "Sponsor profile not found."}, status=status.HTTP_403_FORBIDDEN)
 
-        notvalidids = []
+        notvalidids = list(invalid_format_ids)
         
-        for i in patientprofiledeleteids:
+        for i in valid_ids:
             try:
                 patiend_deleteobj=PatientProfile.objects.get(id=i)
                 if sponsor_user and patiend_deleteobj.sponsor_id != logged_sponsor.id:
@@ -3357,7 +3245,7 @@ class PatientProfileList(APIView):
         try:
             with transaction.atomic():
                 deleted_count, _ = PatientProfile.objects.filter(
-                    id__in=patientprofiledeleteids
+                    id__in=valid_ids
                 ).delete()
 
                 if deleted_count == 0:
@@ -3408,7 +3296,9 @@ class SponsoridPatientProfileList(APIView):
         try:
             
             verimed_doctor_qs = PatientProfile.objects.filter(sponsor=sponsor.id)
-            serializer = PatientProfileViewSlr(verimed_doctor_qs, many=True)
+            serializer = PatientProfileViewSlr(
+                verimed_doctor_qs, many=True, context={"request": request}
+            )
             
             response_data = []
             
@@ -3464,21 +3354,17 @@ class SponsoridPatientProfileDelete(APIView):
                     status=status.HTTP_400_BAD_REQUEST
                 )
             
-        # Get list of IDs from request data
-        if hasattr(request.data, "getlist"):
-            patientprofiledeleteids = request.data.get("patientprofiledeleteids")  # form-data
-        else:
-            patientprofiledeleteids = request.data.get("patientprofiledeleteids", [])  # JSON list
+        valid_ids, invalid_format_ids = _extract_id_list(request, "patientprofiledeleteids")
 
-        if not patientprofiledeleteids:
+        if not valid_ids and not invalid_format_ids:
             return Response(
                 {"error": "No Patient Deleteids Deleted IDs provided."},
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        notvalidids = []
+        notvalidids = list(invalid_format_ids)
         
-        for i in patientprofiledeleteids:
+        for i in valid_ids:
             try:
                 patientprofiledeleteobj=PatientProfile.objects.get(id=i,sponsor=sponsor)
             except PatientProfile.DoesNotExist:
@@ -3497,14 +3383,14 @@ class SponsoridPatientProfileDelete(APIView):
         # --- DATABASE DE choose LETE ---
         try:
             with transaction.atomic():
-                for i in patientprofiledeleteids:
+                for i in valid_ids:
                     try:
                         patientprofiledeleteobj = PatientProfile.objects.get(id=i,sponsor=sponsor)
                         
                         
                         # Delete related documents
                         PatientUploadDocuments.objects.filter(
-                            referid=patientprofiledeleteobj.id,
+                            Q(patient_profile=patientprofiledeleteobj) | Q(referid=str(patientprofiledeleteobj.id))
                         ).delete()
 
                         # Delete the award
@@ -3532,13 +3418,9 @@ class SponsorProfileUpdate(APIView):
         if not update_data:
             return Response({"error": "sponsorprofile_update_data is mandatory"}, status=status.HTTP_400_BAD_REQUEST)
         
-        # If user_update_data is a JSON string, parse it
-        if isinstance(update_data, str):
-            import json
-            try:
-                data = json.loads(update_data)
-            except Exception:
-                return Response({"error": "Invalid JSON format"}, status=status.HTTP_400_BAD_REQUEST)
+        data, parse_err = _parse_json_payload(update_data)
+        if parse_err or not isinstance(data, dict):
+            return Response({"error": parse_err or "Invalid JSON format"}, status=status.HTTP_400_BAD_REQUEST)
 
         
         try:
@@ -3567,21 +3449,17 @@ class SponsorProfileUpdate(APIView):
             )
             
     def delete(self,request):
-            # Get list of IDs from request data
-            if hasattr(request.data, "getlist"):
-                sponsorprofiledeleteids = request.data.get("sponsorprofiledeleteids")  # form-data
-            else:
-                sponsorprofiledeleteids = request.data.get("sponsorprofiledeleteids", [])  # JSON list
+            valid_ids, invalid_format_ids = _extract_id_list(request, "sponsorprofiledeleteids")
     
-            if not sponsorprofiledeleteids:
+            if not valid_ids and not invalid_format_ids:
                 return Response(
                     {"error": "No SponsorProfile Deleted IDs provided."},
                     status=status.HTTP_400_BAD_REQUEST
                 )
             
-            notvalidids = []
+            notvalidids = list(invalid_format_ids)
             
-            for i in sponsorprofiledeleteids:
+            for i in valid_ids:
                 try:
                     spon_deleteobj=SponsorProfile.objects.get(id=i)
                 except SponsorProfile.DoesNotExist:
@@ -3601,7 +3479,7 @@ class SponsorProfileUpdate(APIView):
             try:
                 with transaction.atomic():
                     deleted_count, _ = SponsorProfile.objects.filter(
-                        id__in=sponsorprofiledeleteids
+                        id__in=valid_ids
                     ).delete()
 
                     if deleted_count == 0:
@@ -3683,13 +3561,9 @@ class CaretakerProfileUpdate(APIView):
         if not update_data:
             return Response({"error": "caretakerprofile_update_data is mandatory"}, status=status.HTTP_400_BAD_REQUEST)
         
-        # If user_update_data is a JSON string, parse it
-        if isinstance(update_data, str):
-            import json
-            try:
-                data = json.loads(update_data)
-            except Exception:
-                return Response({"error": "Invalid JSON format"}, status=status.HTTP_400_BAD_REQUEST)
+        data, parse_err = _parse_json_payload(update_data)
+        if parse_err or not isinstance(data, dict):
+            return Response({"error": parse_err or "Invalid JSON format"}, status=status.HTTP_400_BAD_REQUEST)
 
         
         try:
@@ -3747,36 +3621,39 @@ class DoctorReportsCRUD(APIView):
         if not raw_data:
             return Response({"error": "doc_reports_data is mandatory"}, status=status.HTTP_400_BAD_REQUEST)
 
-        if isinstance(raw_data, str):
-            try:
-                report_data = json.loads(raw_data)
-            except json.JSONDecodeError:
-                return Response({"error": "Invalid JSON format"}, status=status.HTTP_400_BAD_REQUEST)
-        elif isinstance(raw_data, dict):
-            report_data = raw_data
-        else:
+        report_data, parse_err = _parse_json_payload(raw_data)
+        if parse_err or not isinstance(report_data, dict):
             return Response(
-                {"error": "Invalid data type. Expected JSON string or dict."},
+                {"error": parse_err or "Invalid data type. Expected JSON string or dict."},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
         # Step 2: Validate Foreign Keys
-        sponid=report_data.get("sponsor")
-        spon_obj=None
+        doc_id = report_data.get("doctor") or report_data.get("doc")
+        if not doc_id:
+            return Response({"error": "doctor ID is mandatory"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            doc_obj = DoctorProfile.objects.get(id=doc_id)
+        except DoctorProfile.DoesNotExist:
+            return Response({"error": "Invalid doctor ID"}, status=status.HTTP_404_NOT_FOUND)
+
+        patient_id = report_data.get("patient")
+        if not patient_id:
+            return Response({"error": "patient ID is mandatory"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            patient_obj = PatientProfile.objects.get(id=patient_id)
+        except PatientProfile.DoesNotExist:
+            return Response({"error": "Invalid patient ID"}, status=status.HTTP_404_NOT_FOUND)
+
+        sponid = report_data.get("sponsor")
+        spon_obj = None
         if sponid:
             try:
                 spon_obj = SponsorProfile.objects.get(id=sponid)
             except SponsorProfile.DoesNotExist:
                 return Response({"error": "Invalid sponsor ID"}, status=status.HTTP_404_NOT_FOUND)
-
-        
-        doc_id = report_data.get("doctor")
-        doc_obj = None
-        if doc_id:
-            try:
-                doc_obj = DoctorProfile.objects.get(id=doc_id)
-            except DoctorProfile.DoesNotExist:
-                return Response({"error": "Invalid doctor ID"}, status=status.HTTP_404_NOT_FOUND)
+        elif patient_obj is not None:
+            spon_obj = patient_obj.sponsor
 
         caretaker_id = report_data.get("caretaker")
         caretaker_obj = None
@@ -3785,17 +3662,15 @@ class DoctorReportsCRUD(APIView):
                 caretaker_obj = CareTakerProfile.objects.get(id=caretaker_id)
             except CareTakerProfile.DoesNotExist:
                 return Response({"error": "Invalid caretaker ID"}, status=status.HTTP_404_NOT_FOUND)
-
-        patient_id = report_data.get("patient")
-        patient_obj = None
-        if patient_id:
-            try:
-                patient_obj = PatientProfile.objects.get(id=patient_id)
-            except PatientProfile.DoesNotExist:
-                return Response({"error": "Invalid patient ID"}, status=status.HTTP_404_NOT_FOUND)
             
-        # Step 3: Get uploaded files (multiple)
-        doctor_report_files = request.FILES.getlist("doc_reports")
+        # Step 3: Get uploaded files (multiple), avoiding duplicates
+        doctor_report_files = list(request.FILES.getlist("doc_reports"))
+        if not doctor_report_files:
+            doctor_report_files = (
+                list(request.FILES.getlist("results_records"))
+                + list(request.FILES.getlist("diagnostic_images"))
+                + list(request.FILES.getlist("voice_notes"))
+            )
 
 
         # Step 4: Transaction block to ensure atomic save
@@ -3842,11 +3717,10 @@ class DoctorReportsCRUD(APIView):
                             referid=doc_reports.id
                         )
                 
-                sponsorname=spon_obj.user.first_name
-                doctorname=doc_obj.user.first_name
-                patientname=patient_obj.patient_name
-                caretakername=caretaker_obj.user.first_name
-                
+                sponsorname = getattr(getattr(spon_obj, "user", None), "first_name", None) or "Valued Client"
+                sponsoremail = getattr(getattr(spon_obj, "user", None), "email", None)
+                doctoremail = getattr(getattr(doc_obj, "user", None), "email", None)
+                recipient_list = [e for e in (sponsoremail, doctoremail) if e]
                 
                 from django.core.mail import EmailMessage
                 from django.conf import settings
@@ -3856,11 +3730,13 @@ class DoctorReportsCRUD(APIView):
                     "https://verimed-fe.vercel.app/",
                 )
 
-                def send_api_verticalcontact_mail(sponsorname):
+                def send_api_verticalcontact_mail(recipient_name):
+                    if not recipient_list:
+                        return False
                     subject = "Your VeriMED Service Report Will Be Available Soon"
 
                     message = f"""
-                    <p>Hello <strong>{sponsorname}</strong>,</p>
+                    <p>Hello <strong>{recipient_name}</strong>,</p>
 
                     <p>
                         Your recent VeriMED service or consultation has been completed.
@@ -3905,21 +3781,19 @@ class DoctorReportsCRUD(APIView):
                     
                     from_email = settings.DEFAULT_FROM_EMAIL
                     
-                    # ✅ Add three recipient emails
-                    sponsoremail = spon_obj.user.email
-                    caretakeremail = caretaker_obj.user.email
-                    doctoremail = doc_obj.user.email
-
-                    recipient_list = [sponsoremail, doctoremail]
-
-                    
                     try:
                         email_msg = EmailMessage(subject, "", from_email, recipient_list)
                        
 
                         # ✅ Attach each uploaded file to the email
                         for f in doctor_report_files:
-                            email_msg.attach(f.name, f.read(), f.content_type)
+                            if hasattr(f, "seek"):
+                                f.seek(0)
+                            email_msg.attach(
+                                f.name,
+                                f.read(),
+                                getattr(f, "content_type", None) or "application/octet-stream",
+                            )
 
                         # ✅ Send the email
                         email_msg.content_subtype = "html"  # VERY IMPORTANT
@@ -3949,16 +3823,10 @@ class DoctorReportsCRUD(APIView):
         if not raw_data:
             return Response({"error": "doc_reports_data is mandatory"}, status=status.HTTP_400_BAD_REQUEST)
 
-        if isinstance(raw_data, str):
-            try:
-                report_data = json.loads(raw_data)
-            except json.JSONDecodeError:
-                return Response({"error": "Invalid JSON format"}, status=status.HTTP_400_BAD_REQUEST)
-        elif isinstance(raw_data, dict):
-            report_data = raw_data
-        else:
+        report_data, parse_err = _parse_json_payload(raw_data)
+        if parse_err or not isinstance(report_data, dict):
             return Response(
-                {"error": "Invalid data type. Expected JSON string or dict."},
+                {"error": parse_err or "Invalid data type. Expected JSON string or dict."},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -3970,62 +3838,65 @@ class DoctorReportsCRUD(APIView):
             except DoctorReports.DoesNotExist:
                 return Response({"error": "Invalid doc_report_updateid ID"}, status=status.HTTP_404_NOT_FOUND)
         else:
-            return Response({"error": "doc_report_updateid ID is mandatory"}, status=status.HTTP_404_NOT_FOUND)
+            return Response({"error": "doc_report_updateid ID is mandatory"}, status=status.HTTP_400_BAD_REQUEST)
             
 
-        # Step 2: Validate Foreign Keys
-        sponid=report_data.get("sponsor")
-        spon_obj=None
-        if sponid:
-            try:
-                spon_obj = SponsorProfile.objects.get(id=sponid)
-            except SponsorProfile.DoesNotExist:
-                return Response({"error": "Invalid sponsor ID"}, status=status.HTTP_404_NOT_FOUND)
+        # Step 2: Validate Foreign Keys (only when provided in payload)
+        has_sponsor_key = "sponsor" in report_data
+        spon_obj = updateobj.sponsor
+        if has_sponsor_key:
+            sponid = report_data.get("sponsor")
+            if sponid:
+                try:
+                    spon_obj = SponsorProfile.objects.get(id=sponid)
+                except SponsorProfile.DoesNotExist:
+                    return Response({"error": "Invalid sponsor ID"}, status=status.HTTP_404_NOT_FOUND)
+            else:
+                spon_obj = None
 
-        
-        doc_id = report_data.get("doc")
-        doc_obj = None
-        if doc_id:
-            try:
-                doc_obj = DoctorProfile.objects.get(id=doc_id)
-            except DoctorProfile.DoesNotExist:
-                return Response({"error": "Invalid doctor ID"}, status=status.HTTP_404_NOT_FOUND)
+        has_doctor_key = "doctor" in report_data or "doc" in report_data
+        doc_obj = updateobj.doctor
+        if has_doctor_key:
+            doc_id = report_data.get("doctor") or report_data.get("doc")
+            if doc_id:
+                try:
+                    doc_obj = DoctorProfile.objects.get(id=doc_id)
+                except DoctorProfile.DoesNotExist:
+                    return Response({"error": "Invalid doctor ID"}, status=status.HTTP_404_NOT_FOUND)
 
-        caretaker_id = report_data.get("caretaker")
-        caretaker_obj = None
-        if caretaker_id:
-            try:
-                caretaker_obj = CareTakerProfile.objects.get(id=caretaker_id)
-            except CareTakerProfile.DoesNotExist:
-                return Response({"error": "Invalid caretaker ID"}, status=status.HTTP_404_NOT_FOUND)
+        has_caretaker_key = "caretaker" in report_data
+        caretaker_obj = updateobj.caretaker
+        if has_caretaker_key:
+            caretaker_id = report_data.get("caretaker")
+            if caretaker_id:
+                try:
+                    caretaker_obj = CareTakerProfile.objects.get(id=caretaker_id)
+                except CareTakerProfile.DoesNotExist:
+                    return Response({"error": "Invalid caretaker ID"}, status=status.HTTP_404_NOT_FOUND)
+            else:
+                caretaker_obj = None
 
-        patient_id = report_data.get("patient")
-        patient_obj = None
-        if patient_id:
-            try:
-                patient_obj = PatientProfile.objects.get(id=patient_id)
-            except PatientProfile.DoesNotExist:
-                return Response({"error": "Invalid patient ID"}, status=status.HTTP_404_NOT_FOUND)
+        has_patient_key = "patient" in report_data
+        patient_obj = updateobj.patient
+        if has_patient_key:
+            patient_id = report_data.get("patient")
+            if patient_id:
+                try:
+                    patient_obj = PatientProfile.objects.get(id=patient_id)
+                except PatientProfile.DoesNotExist:
+                    return Response({"error": "Invalid patient ID"}, status=status.HTTP_404_NOT_FOUND)
             
         # Step 4: Handle uploaded files
         doc_report_files = list(request.FILES.getlist("doc_reports"))
-        doc_report_ids = list(request.data.getlist("doc_report_ids"))
-        print("lab_report_files",doc_report_files)
-        print("lab_report_ids",doc_report_ids)
-        print(len(doc_report_ids))
-        print(len(doc_report_ids))
-        
-       # --- Normalize lab_report_ids ---
-        # Handle case where input is like ['1,2,null']
-        if len(doc_report_ids) == 1 and "," in doc_report_ids[0]:
-            doc_report_ids = doc_report_ids[0].split(",")
+        doc_report_ids = _extract_str_list(request.data, "doc_report_ids")
 
         # Clean up invalid or placeholder values
         cleaned_ids = []
         for val in doc_report_ids:
-            if val and val.lower() not in ["null", "none", ""]:
+            val_str = str(val).strip() if val is not None else ""
+            if val_str and val_str.lower() not in ["null", "none", ""]:
                 try:
-                    cleaned_ids.append(int(val))
+                    cleaned_ids.append(int(val_str))
                 except ValueError:
                     cleaned_ids.append(None)
             else:
@@ -4035,7 +3906,7 @@ class DoctorReportsCRUD(APIView):
             return Response(
                 {
                     "error": f"The number of lab_reports ({len(doc_report_files)}) "
-                            f"does not match the number of lab_report_ids ({len(doc_report_ids)})"
+                            f"does not match the number of lab_report_ids ({len(cleaned_ids)})"
                 },
                 status=status.HTTP_400_BAD_REQUEST
             )
@@ -4045,34 +3916,22 @@ class DoctorReportsCRUD(APIView):
         try:
             with transaction.atomic():
                 # Foreign Keys
-                updateobj.sponsor=spon_obj
-                updateobj.doctor=doc_obj
-                updateobj.patient=patient_obj
-                updateobj.caretaker=caretaker_obj
-                # Patient Info
-                updateobj.patient_name=report_data.get("patient_name")
-                # updateobj.patient_age=report_data.get("patient_age")
-                # updateobj.patient_gender=report_data.get("patient_gender")
-                # updateobj.nationality=report_data.get("nationality")
-                updateobj.blood_group=report_data.get("blood_group")
-                # Vitals
-                updateobj.bp=report_data.get("bp")
-                updateobj.heart_rate=report_data.get("heart_rate")
-                updateobj.sugar=report_data.get("sugar")
-                updateobj.oxygen=report_data.get("oxygen")
-                updateobj.temperature=report_data.get("temperature")
-                updateobj.respiratory_rate=report_data.get("respiratory_rate")
-                updateobj.weight=report_data.get("weight")
-                # updateobj.status=report_data.get("status")
-                # Address
-                # updateobj.address_1=report_data.get("address_1")
-                # updateobj.address_2=report_data.get("address_2")
-                # updateobj.city=report_data.get("city")
-                # updateobj.state=report_data.get("state")
-                # updateobj.country=report_data.get("country")
-                # updateobj.pincode=report_data.get("pincode")
-                updateobj.doctor_notes=report_data.get("doctor_notes")
-                updateobj.initial_visit=report_data.get("initial_visit",updateobj.initial_visit)
+                updateobj.sponsor = spon_obj
+                updateobj.doctor = doc_obj
+                updateobj.patient = patient_obj
+                updateobj.caretaker = caretaker_obj
+                # Patient Info & Vitals (preserve existing when omitted)
+                updateobj.patient_name = report_data.get("patient_name", updateobj.patient_name)
+                updateobj.blood_group = report_data.get("blood_group", updateobj.blood_group)
+                updateobj.bp = report_data.get("bp", updateobj.bp)
+                updateobj.heart_rate = report_data.get("heart_rate", updateobj.heart_rate)
+                updateobj.sugar = report_data.get("sugar", updateobj.sugar)
+                updateobj.oxygen = report_data.get("oxygen", updateobj.oxygen)
+                updateobj.temperature = report_data.get("temperature", updateobj.temperature)
+                updateobj.respiratory_rate = report_data.get("respiratory_rate", updateobj.respiratory_rate)
+                updateobj.weight = report_data.get("weight", updateobj.weight)
+                updateobj.doctor_notes = report_data.get("doctor_notes", updateobj.doctor_notes)
+                updateobj.initial_visit = report_data.get("initial_visit", updateobj.initial_visit)
                 
                 updateobj.save()
                 
@@ -4099,6 +3958,8 @@ class DoctorReportsCRUD(APIView):
                     status=status.HTTP_200_OK
                 )
 
+        except NotFound as e:
+            return Response({"error": str(e.detail)}, status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -4122,19 +3983,29 @@ class DoctorReportsCRUD(APIView):
                         return Response([], status=status.HTTP_200_OK)
                     verimed_doctor_qs = filter_queryset_by_sponsor(verimed_doctor_qs, sponsor_obj)
 
+            patient_param = (
+                request.query_params.get("patient_id")
+                or request.query_params.get("patientid")
+                or request.query_params.get("patient")
+            )
+            if patient_param:
+                try:
+                    verimed_doctor_qs = verimed_doctor_qs.filter(patient_id=int(patient_param))
+                except (TypeError, ValueError):
+                    return Response([], status=status.HTTP_200_OK)
+
+            verimed_doctor_qs = verimed_doctor_qs.order_by("-id")
             serializer = DoctorReportsViewSlr(verimed_doctor_qs, many=True,context={"request": request})
             
             response_data = []
 
             for item in serializer.data:
                 docreport_id = item["id"]
-                # patient_id = item["patient"]["id"] if item.get("patient") else None
 
-                # Fetch all lab reports for this appointment & patient
+                # Fetch all lab reports for this report
                 lab_reports_qs = VerimedDoctorReportsFiles.objects.filter(
-                    referid=docreport_id,
-                    
-                )
+                    Q(doc_report_files_id=docreport_id) | Q(referid=str(docreport_id))
+                ).distinct()
 
                 # Build document list
                 documents = []
@@ -4154,29 +4025,21 @@ class DoctorReportsCRUD(APIView):
 
             return Response(response_data, status=status.HTTP_200_OK)
 
-            
-            
-            
         except Exception as e:
-            # return Response(serializer.data, status=status.HTTP_200_OK)
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
               
     def delete(self,request):
-        # Get list of IDs from request data
-        if hasattr(request.data, "getlist"):
-            doctorreportsdeleteids = request.data.get("doctorreportsdeleteids")  # form-data
-        else:
-            doctorreportsdeleteids = request.data.get("doctorreportsdeleteids", [])  # JSON list
+        valid_ids, invalid_format_ids = _extract_id_list(request, "doctorreportsdeleteids")
 
-        if not doctorreportsdeleteids:
+        if not valid_ids and not invalid_format_ids:
             return Response(
                 {"error": "No Doctor Reports Deleteids Deleted IDs provided."},
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        notvalidids = []
+        notvalidids = list(invalid_format_ids)
         
-        for i in doctorreportsdeleteids:
+        for i in valid_ids:
             try:
                 doctorreportsdeleteobj=DoctorReports.objects.get(id=i)
             except DoctorReports.DoesNotExist:
@@ -4195,16 +4058,16 @@ class DoctorReportsCRUD(APIView):
         # --- DATABASE DE choose LETE ---
         try:
             with transaction.atomic():
-                for i in doctorreportsdeleteids:
+                for i in valid_ids:
                     try:
                         doctorreportsdeleteobj = DoctorReports.objects.get(id=i)
                         
                         # Delete related documents
                         VerimedDoctorReportsFiles.objects.filter(
-                            referid=doctorreportsdeleteobj.id,
+                            Q(doc_report_files=doctorreportsdeleteobj) | Q(referid=str(doctorreportsdeleteobj.id))
                         ).delete()
 
-                        # Delete the award
+                        # Delete the report
                         doctorreportsdeleteobj.delete()
                              
                     except DoctorReports.DoesNotExist:
@@ -4220,23 +4083,22 @@ class DoctorReportsCRUD(APIView):
 
 
 class ContactUsC(APIView):
+    permission_classes = [AllowAny]
     def post(self,request):
         data=request.data
         country_code_obj=None
-        phonewithcountrycode=None
+        dialcode=None
         country_code = data.get("country_code")
         if country_code:
-            phone = data.get("phone")
-            if phone: 
-                try:
-                    country_code_obj = VerimedCountryCode.objects.get(code=country_code)
-                    dialcode = country_code_obj.dial_code
-                    phonewithcountrycode = f"{dialcode}-{phone}"
-                except VerimedCountryCode.DoesNotExist:
-                    return Response(
-                        {"error": "Invalid country_code"},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
+            try:
+                country_code_obj = VerimedCountryCode.objects.get(code=country_code)
+                dialcode = country_code_obj.dial_code
+            except VerimedCountryCode.DoesNotExist:
+                return Response(
+                    {"error": "Invalid country_code"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        phonewithcountrycode = _format_phone_with_dial(dialcode, data.get("phone"))
         
         try:
             with transaction.atomic():
@@ -4255,6 +4117,8 @@ class ContactUsC(APIView):
                 from django.core.mail import EmailMessage
                 from django.conf import settings
                 def send_api_verticalcontact_mail():
+                    if not contactus.email:
+                        return False
                     subject = f" Sucessfully"
                     message = (
                         f"Department:{contactus.department}\n"
@@ -4268,12 +4132,7 @@ class ContactUsC(APIView):
                     )
                     
                     from_email = settings.DEFAULT_FROM_EMAIL
-                    
-                    # ✅ Add three recipient emails
-                    email = contactus.email
-                    
-                    recipient_list = [email]
-
+                    recipient_list = [contactus.email]
                     
                     try:
                         email_msg = EmailMessage(subject, message, from_email, recipient_list)
@@ -4302,21 +4161,17 @@ class ContactUsRD(APIView):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     def delete(self,request):
-        # Get list of IDs from request data
-        if hasattr(request.data, "getlist"):
-            contactusdeleteids = request.data.get("contactusdeleteids")  # form-data
-        else:
-            contactusdeleteids = request.data.get("contactusdeleteids", [])  # JSON list
+        valid_ids, invalid_format_ids = _extract_id_list(request, "contactusdeleteids")
 
-        if not contactusdeleteids:
+        if not valid_ids and not invalid_format_ids:
             return Response(
                 {"error": "No ContactUs Deleteids Deleted IDs provided."},
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        notvalidids = []
+        notvalidids = list(invalid_format_ids)
         
-        for i in contactusdeleteids:
+        for i in valid_ids:
             try:
                 contactusdeleteobj=ContactUs.objects.get(id=i)
             except ContactUs.DoesNotExist:
@@ -4325,7 +4180,7 @@ class ContactUsRD(APIView):
         if notvalidids:
             return Response(
                 {
-                    "error": "Invalid Doctor Reports Deleteids Deleted IDs.",
+                    "error": "Invalid ContactUs Deleted IDs.",
                     "invalid_ids": notvalidids
                 },
                 status=status.HTTP_400_BAD_REQUEST
@@ -4335,15 +4190,12 @@ class ContactUsRD(APIView):
         # --- DATABASE DE choose LETE ---
         try:
             with transaction.atomic():
-                for i in contactusdeleteids:
+                for i in valid_ids:
                     try:
                         contactusdeleteobj = ContactUs.objects.get(id=i)
-
-                        # Delete the award
                         contactusdeleteobj.delete()
-                             
                     except ContactUs.DoesNotExist:
-                        return Response({"error": "Invalid Doctor Report  Deleteid ID"}, status=status.HTTP_404_NOT_FOUND)
+                        return Response({"error": "Invalid ContactUs Deleteid ID"}, status=status.HTTP_404_NOT_FOUND)
 
                 return Response({"message": "ContactUs Deleted sucessfully"}, status=status.HTTP_200_OK)
                     
@@ -4355,22 +4207,21 @@ class ContactUsRD(APIView):
 
 
 class KetnyproductionCheckC(APIView):
+    permission_classes = [AllowAny]
     
     def post(self, request):
 
         raw_data = request.data.get("ketnyproduct_payload")
-        print("raw_data", raw_data)
-        
-        if isinstance(raw_data, str):
-            try:
-                dep_data = json.loads(raw_data)
-            except json.JSONDecodeError:
-                return Response({"error": "Invalid JSON format"}, status=status.HTTP_400_BAD_REQUEST)
-        elif isinstance(raw_data, dict):
-            dep_data = raw_data
-        else:
+        if not raw_data:
             return Response(
-                {"error": "Invalid data type. Expected JSON string or dict."},
+                {"error": "ketnyproduct_payload is mandatory"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        dep_data, parse_err = _parse_json_payload(raw_data)
+        if parse_err or not isinstance(dep_data, dict):
+            return Response(
+                {"error": parse_err or "Invalid data type. Expected JSON string or dict."},
                 status=status.HTTP_400_BAD_REQUEST
             )
         name = dep_data.get("name") 
@@ -4404,11 +4255,7 @@ class KetnyproductionCheckC(APIView):
             countrycode_obj=None
             dialcode=None
         
-        mobile = dep_data.get("phone")
-        if mobile:
-            phonewithcountrycode = f"{dialcode}-{mobile}"
-        else:
-            phonewithcountrycode=None
+        phonewithcountrycode = _format_phone_with_dial(dialcode, dep_data.get("phone"))
             
             
         emergency_country_code = dep_data.get("emergency_country_code")
@@ -4416,28 +4263,24 @@ class KetnyproductionCheckC(APIView):
 
             try:
                 emergency_country_code_obj = VerimedCountryCode.objects.get(code=emergency_country_code)
-                dialcode = countrycode_obj.dial_code
+                emr_dialcode = emergency_country_code_obj.dial_code
             except VerimedCountryCode.DoesNotExist:
                 return Response(
                     {"error": "Invalid Country Code"},
                     status=status.HTTP_400_BAD_REQUEST
                 )
         else:
-            emergency_country_code=None
-            dialcode=None
+            emergency_country_code_obj=None
+            emr_dialcode=None
         
-        emergency_phone = dep_data.get("emergency_phone")
-        if emergency_phone:
-            emrphonewithcountrycode = f"{dialcode}-{mobile}"
-        else:
-            emrphonewithcountrycode=None
+        emrphonewithcountrycode = _format_phone_with_dial(emr_dialcode, dep_data.get("emergency_phone"))
         
         
        
         # --- MAIN TRANSACTION ---
         try:
             with transaction.atomic():
-                # Create main asset_cleaned_data.get("department")
+                # Create screening check record
                 verimeddepartment = KetnyproductionCheck.objects.create(
                     name=name,
                     country_code=countrycode_obj,
@@ -4459,95 +4302,64 @@ class KetnyproductionCheckC(APIView):
                     screening_date=dep_data.get("screening_date"),
                 )
             
-                from django.core.mail import EmailMultiAlternatives
-                from django.conf import settings
+            from django.core.mail import EmailMultiAlternatives
+            from django.conf import settings
+            from django.template.loader import render_to_string
 
-                from django.conf import settings
-                from django.core.mail import EmailMultiAlternatives
-                from django.template.loader import render_to_string
-
-
-                def sendmail(user_email):
+            def sendmail(user_email):
+                if not user_email:
+                    return False
+                try:
                     subject = "Free Diabetes Screening & Kidney Protection Check"
                     from_email = settings.DEFAULT_FROM_EMAIL
-                    recipient_list = [user_email]   # must be a list
+                    recipient_list = [user_email]
 
-                    # Render HTML template
                     html_content = render_to_string("user_notification.html")
 
                     mail = EmailMultiAlternatives(
                         subject=subject,
-                        body="Your form submission successfully",  # fallback text
+                        body="Your form submission successfully",
                         from_email=from_email,
                         to=recipient_list
                     )
 
                     mail.attach_alternative(html_content, "text/html")
                     mail.send()
-
                     print("Email sent successfully")
+                    return True
+                except Exception as mail_err:
+                    print(f"Error sending user screening email: {mail_err}")
+                    return False
 
-
-                # get email
-                email = verimeddepartment.email
-
-                # call function
-                sendmail(email)
-                # to_email = ["ramraja.e99@gmail.com", "ramraja.e999@gmail.com"]
-
-                # def sendadminmail():
-                #     subject = "Form from Client"
-                #     message = ""
-
-                #     from_email = settings.DEFAULT_FROM_EMAIL
-                #     recipient_list = to_email
-
-                #     send_mail(
-                #         subject,
-                #         message,
-                #         from_email,
-                #         recipient_list,
-                #         fail_silently=False
-                #     )
-
-                #     print("Admin notification email sent successfully")
-
-
-                # # Call function
-                # sendadminmail()
-                
-            from django.core.mail import EmailMultiAlternatives
-            from django.conf import settings
-            from django.template.loader import render_to_string
-
-
-            # to_email = ["ramraja.e99@gmail.com", "karthiksriram682@gmail.com"]
+            sendmail(verimeddepartment.email)
 
             to_email = ["screenings@verimed.care","info@verimed.care"]
 
-            def sendadminmail(verimeddepartment):
+            def sendadminmail(verimed_entry):
+                try:
+                    subject = "Free Diabetes Screening & Kidney Protection Check"
+                    from_email = settings.DEFAULT_FROM_EMAIL
+                    recipient_list = to_email
 
-                subject = "Free Diabetes Screening & Kidney Protection Check"
-                from_email = settings.DEFAULT_FROM_EMAIL
-                recipient_list = to_email
+                    html_content = render_to_string(
+                        "admin_notification.html",
+                        {"verimeddepartment": verimed_entry}
+                    )
 
-                # Render HTML template
-                html_content = render_to_string(
-                    "admin_notification.html",
-                    {"verimeddepartment": verimeddepartment}
-                )
+                    mail = EmailMultiAlternatives(
+                        subject=subject,
+                        body="New form submission received",
+                        from_email=from_email,
+                        to=recipient_list
+                    )
 
-                email = EmailMultiAlternatives(
-                    subject=subject,
-                    body="New form submission received",  # fallback text
-                    from_email=from_email,
-                    to=recipient_list
-                )
-
-                email.attach_alternative(html_content, "text/html")
-                email.send()
-
-                print("Admin notification email sent successfully")
+                    mail.attach_alternative(html_content, "text/html")
+                    mail.send()
+                    print("Admin notification email sent successfully")
+                    return True
+                except Exception as mail_err:
+                    print(f"Error sending admin screening email: {mail_err}")
+                    return False
                 
             sendadminmail(verimeddepartment)        
 
@@ -4568,22 +4380,17 @@ class KetnyproductionCheckRD(APIView):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     def delete(self,request):
-            
-        # Get list of IDs from request data
-        if hasattr(request.data, "getlist"):
-            freekidneydeleteids = request.data.get("freekidneydeleteids")  # form-data
-        else:
-            freekidneydeleteids = request.data.get("freekidneydeleteids", [])  # JSON list
+        valid_ids, invalid_format_ids = _extract_id_list(request, "freekidneydeleteids")
 
-        if not freekidneydeleteids:
+        if not valid_ids and not invalid_format_ids:
             return Response(
                 {"error": "No Patient freekidneydeleteids Deleted IDs provided."},
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        notvalidids = []
+        notvalidids = list(invalid_format_ids)
         
-        for i in freekidneydeleteids:
+        for i in valid_ids:
             try:
                 freekidneydeleteobj=KetnyproductionCheck.objects.get(id=i)
             except KetnyproductionCheck.DoesNotExist:
@@ -4592,7 +4399,7 @@ class KetnyproductionCheckRD(APIView):
         if notvalidids:
             return Response(
                 {
-                    "error": "Invalid Patient Profile Deleteids Deleted IDs.",
+                    "error": "Invalid KetnyproductionCheck Deleted IDs.",
                     "invalid_ids": notvalidids
                 },
                 status=status.HTTP_400_BAD_REQUEST
@@ -4602,13 +4409,10 @@ class KetnyproductionCheckRD(APIView):
         # --- DATABASE DE choose LETE ---
         try:
             with transaction.atomic():
-                try:
-                    patientprofiledeleteobj = KetnyproductionCheck.objects.filter(id__in=freekidneydeleteids)
-                    patientprofiledeleteobj.delete()
-                    return Response({"message": "Deleted sucessfully"}, status=status.HTTP_200_OK)
-
-                except PatientProfile.DoesNotExist:
-                    return Response({"error": "Invalid KetnyproductionCheck Profile  Deleteid ID"}, status=status.HTTP_404_NOT_FOUND)
+                deleted_count, _ = KetnyproductionCheck.objects.filter(id__in=valid_ids).delete()
+                if deleted_count == 0:
+                    return Response({"error": "Invalid KetnyproductionCheck Deleteid ID"}, status=status.HTTP_404_NOT_FOUND)
+                return Response({"message": "Deleted sucessfully"}, status=status.HTTP_200_OK)
                     
         except Exception as e:
             return Response(
@@ -4636,6 +4440,9 @@ def payment_page(request):
 
 
 def create_checkout_session(request):
+    backend_base_url = getattr(
+        settings, "FRONTEND_URL", "https://verimed-be.vercel.app"
+    ).rstrip("/")
 
     session = stripe.checkout.Session.create(
         mode="payment",
@@ -4652,11 +4459,8 @@ def create_checkout_session(request):
                 "quantity": 1,
             }
         ],
-        success_url="https://verimedramja.pythonanywhere.com/verimed/success/?session_id={CHECKOUT_SESSION_ID}",
-        cancel_url="https://verimedramja.pythonanywhere.com/verimed/cancel/",
-        # success_url="http://127.0.0.1:8000/verimed/success/?session_id={CHECKOUT_SESSION_ID}",
-        # cancel_url="http://127.0.0.1:8000/verimedramja.pythonanywhere.com/verimed/cancel/",
-
+        success_url=f"{backend_base_url}/verimed/success/?session_id={{CHECKOUT_SESSION_ID}}",
+        cancel_url=f"{backend_base_url}/verimed/cancel/",
     )
 
     # HTTP 303 is recommended

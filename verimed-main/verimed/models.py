@@ -522,7 +522,7 @@ class ContactUs(models.Model):
         db_table = "verimed_contactus"
 
     def __str__(self):
-        return f"{self.id}-{self.departmentc}"
+        return f"{self.id}-{self.department}"
     
 
 
