@@ -280,6 +280,7 @@ FRONTEND_DASHBOARD_URL = os.environ.get(
 
 # STRIPE_SECRET_KEY = "your_stripe_secret_key_here"
 
-STRIPE_SECRET_KEY = "sk_test_placeholder"
-STRIPE_PUBLISHABLE_KEY = "pk_test_placeholder"
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "sk_test_placeholder")
+STRIPE_PUBLISHABLE_KEY = os.environ.get("STRIPE_PUBLISHABLE_KEY", "pk_test_placeholder")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 

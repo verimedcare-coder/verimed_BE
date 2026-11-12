@@ -1,7 +1,7 @@
 from django.urls import path
 # from .views import*
 from . import views
-from .views import VerimedCountrycode,VerimedDepartmentCreateUpdate,VerimedBookAppoinmentCreateUpdate,AppoinmentStatusChoices,VB_PatientAppoinment_List,VB_DoctorAppoinment_List,VB_SponsorAppoinment_List,UserCreate,UserUpdate,UserDelete,UserLogin,UserLogout,SponsorProfileList,PatientProfileList,DoctorProfileList,CareTakerProfileList,UserChoices,UserSignup,UserEmailVerify,UserView,DoctorProfileUpdate,PatientProfileCreateUpdate,SponsorProfileUpdate,CaretakerProfileUpdate,DoctorReportsCRUD,SponsoridPatientProfileList,ContactUsC,ContactUsRD,SponsoridPatientProfileDelete,KetnyproductionCheckC,KetnyproductionCheckRD,UserUpdateUser
+from .views import VerimedCountrycode,VerimedDepartmentCreateUpdate,VerimedBookAppoinmentCreateUpdate,AppoinmentStatusChoices,VB_PatientAppoinment_List,VB_DoctorAppoinment_List,VB_SponsorAppoinment_List,UserCreate,UserUpdate,UserDelete,UserLogin,UserLogout,SponsorProfileList,PatientProfileList,DoctorProfileList,CareTakerProfileList,UserChoices,UserSignup,UserEmailVerify,UserView,DoctorProfileUpdate,PatientProfileCreateUpdate,SponsorProfileUpdate,CaretakerProfileUpdate,DoctorReportsCRUD,SponsoridPatientProfileList,ContactUsC,ContactUsRD,SponsoridPatientProfileDelete,KetnyproductionCheckC,KetnyproductionCheckRD,UserUpdateUser,CreateAppointmentCheckoutSession,VerifyAppointmentCheckoutSession,CancelAppointmentCheckoutSession
 
 urlpatterns = [
     path('verimed_countrycode/', VerimedCountrycode.as_view(), name='verimed_department_create'),
@@ -60,6 +60,9 @@ urlpatterns = [
     # payment urls
     path("payment/", views.payment_page, name="payment"),
     path("create-checkout-session/", views.create_checkout_session, name="create_checkout"),
+    path("appointment-checkout/create/", CreateAppointmentCheckoutSession.as_view(), name="appointment-checkout-create"),
+    path("appointment-checkout/verify/", VerifyAppointmentCheckoutSession.as_view(), name="appointment-checkout-verify"),
+    path("appointment-checkout/cancel/", CancelAppointmentCheckoutSession.as_view(), name="appointment-checkout-cancel"),
     path("success/", views.success, name="success"),
     path("cancel/", views.cancel, name="cancel"),
     path("stripe/webhook/", views.stripe_webhook, name="stripe-webhook"),

@@ -1578,205 +1578,443 @@ class AppoinmentStatusChoices(APIView):
         return Response(appoinment_status, status=status.HTTP_200_OK)
                     
 
+APPOINTMENT_PENDING_PAYMENT_STATUS = "PaymentPending"
+
+_APPOINTMENT_SERVICE_PRICE_CATALOG = (
+    ("Comprehensive Physician Intake In Person", 12500),
+    ("In Home Follow Up Physician Visit", 9500),
+    ("Virtual Physician Visit", 5500),
+    ("Nurse Wellness Check", 5000),
+    ("Rehydration & IV Fluid Therapy", 6000),
+    ("Infusion Therapy for Prescribed Medications", 9000),
+    ("Care Management & Navigation", 10000),
+    ("Wellness Coaching", 7500),
+    ("Diabetes Coaching & Chronic Illness Management", 11500),
+    ("Live-in Family Wellness Nurse", 49500),
+)
+
+
+def _normalize_service_name(name):
+    import re
+    cleaned = str(name or "").lower()
+    cleaned = re.sub(r"[()\-_&,/]+", " ", cleaned)
+    cleaned = re.sub(r"\bmedications\b", "medication", cleaned)
+    cleaned = re.sub(r"\bfollow[\s-]?ups?\b", "follow up", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _is_matching_service(service_a, service_b):
+    a = _normalize_service_name(service_a)
+    b = _normalize_service_name(service_b)
+    if not a or not b:
+        return False
+    return a == b or a in b or b in a
+
+
+def _resolve_appointment_service_pricing(appointment_type=None, dep_obj=None, raw_amount=None):
+    import re
+    from decimal import Decimal, InvalidOperation
+
+    candidates = [
+        str(appointment_type or "").strip(),
+        str(getattr(dep_obj, "dep_name", None) or "").strip(),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        for catalog_name, cents in _APPOINTMENT_SERVICE_PRICE_CATALOG:
+            if _is_matching_service(candidate, catalog_name):
+                return cents, catalog_name
+
+        clean = candidate.lower()
+        if "comprehensive" in clean or "intake" in clean:
+            return 12500, "Comprehensive Physician Intake In Person"
+        if "home" in clean and ("visit" in clean or "follow" in clean):
+            return 9500, "In Home Follow Up Physician Visit"
+        if "virtual" in clean:
+            return 5500, "Virtual Physician Visit"
+        if "live-in" in clean or "live in" in clean or "family wellness nurse" in clean:
+            return 49500, "Live-in Family Wellness Nurse"
+        if "nurse" in clean and "wellness" in clean:
+            return 5000, "Nurse Wellness Check"
+        if "rehydration" in clean or "fluid" in clean or re.search(r"\biv\b", clean):
+            return 6000, "Rehydration & IV Fluid Therapy"
+        if "infusion" in clean:
+            return 9000, "Infusion Therapy for Prescribed Medications"
+        if "navigation" in clean or "care management" in clean:
+            return 10000, "Care Management & Navigation"
+        if "diabetes" in clean or "chronic" in clean:
+            return 11500, "Diabetes Coaching & Chronic Illness Management"
+        if "wellness coaching" in clean or "coaching" in clean:
+            return 7500, "Wellness Coaching"
+
+    fallback_name = next((c for c in candidates if c), "VeriMED Medical Appointment")
+    if raw_amount is not None and str(raw_amount).strip() != "":
+        amt_match = re.match(r"^\s*\$?\s*(\d+(?:\.\d{1,2})?)\s*$", str(raw_amount))
+        if amt_match:
+            try:
+                cents = int((Decimal(amt_match.group(1)) * Decimal("100")).quantize(Decimal("1")))
+                if cents > 0:
+                    return cents, fallback_name
+            except (InvalidOperation, ValueError):
+                pass
+    return None, fallback_name
+
+
+def _user_has_prepaid_service(request_user, sponsor_obj, service_name=None, dep_obj=None):
+    candidates = [service_name, getattr(dep_obj, "dep_name", None)]
+    owned_plans = [
+        getattr(getattr(sponsor_obj, "user", None), "service_purchased", None),
+        getattr(request_user, "service_purchased", None),
+    ]
+    for owned in owned_plans:
+        if not owned:
+            continue
+        for candidate in candidates:
+            if candidate and _is_matching_service(owned, candidate):
+                return True, str(owned).strip()
+    return False, None
+
+
+def _exclude_unpaid_appointment_drafts(queryset):
+    return queryset.exclude(appointment_status=APPOINTMENT_PENDING_PAYMENT_STATUS)
+
+
+def _send_appointment_request_email(appointment):
+    from html import escape as html_escape
+    from django.core.mail import EmailMessage
+    from django.conf import settings
+
+    effective_sponsor = (
+        appointment.sponsor
+        or getattr(appointment.patient, "sponsor", None)
+    )
+    sponsor_user = getattr(effective_sponsor, "user", None)
+    sponsoremail = (getattr(sponsor_user, "email", None) or "").strip()
+    sponsorname = (
+        (getattr(sponsor_user, "first_name", None) or "").strip()
+        or (getattr(sponsor_user, "username", None) or "").strip()
+        or "Valued Family Member"
+    )
+
+    if not sponsoremail:
+        return False, "Sponsor email address is missing."
+
+    subject = "Thank You — Your Appointment Request Is Being Processed"
+    message = f"""
+        <p>Hello <strong>{html_escape(sponsorname)}</strong>,</p>
+
+        <p>
+            Thank you for scheduling with VeriMED, the trusted in-home and virtual care
+            program for Cameroon’s global families.
+        </p>
+
+        <p>
+            Your appointment request has been received. Our care coordination team is
+            reviewing your preferred date and time. You will receive a formal
+            confirmation shortly.
+        </p>
+
+        <p>
+            Thank you for choosing a service designed to give aging parents premium care —
+            and families abroad peace of mind.
+        </p>
+
+        <p>
+            With gratitude,<br>
+            <strong>The VeriMED Clinical & Care Coordination Team</strong><br>
+            Physician-Led. Nurse-Powered. Cameroon’s Trusted Home Health Service.<br>
+            Global-Standard Medical Care for Loved Ones Back Home.
+        </p>
+
+        <p>www.Verimed.care ~~~ Serving Families Worldwide</p>
+        """
+
+    from_email = settings.DEFAULT_FROM_EMAIL
+    recipient_list = [sponsoremail]
+
+    try:
+        email_msg = EmailMessage(subject, "", from_email, recipient_list)
+        email_msg.content_subtype = "html"
+        email_msg.body = message
+        email_msg.send(fail_silently=False)
+        print("Vertical contact email sent successfully")
+        return True, None
+    except Exception as e:
+        print(f"Appoinment Booking Post sending vertical contact email: {e}")
+        return False, str(e)
+
+
+def _validate_and_resolve_appointment_request(request):
+    raw_data = request.data.get("bookappoinment_data")
+    if not raw_data:
+        return None, Response({"error": "bookappoinment_data is mandatory"}, status=status.HTTP_400_BAD_REQUEST)
+
+    if isinstance(raw_data, str):
+        try:
+            report_data = json.loads(raw_data)
+        except json.JSONDecodeError:
+            return None, Response({"error": "Invalid JSON format"}, status=status.HTTP_400_BAD_REQUEST)
+    elif isinstance(raw_data, dict):
+        report_data = raw_data
+    else:
+        return None, Response(
+            {"error": "Invalid data type. Expected JSON string or dict."},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    sponid = report_data.get("sponsor")
+    spon_obj = None
+    if sponid:
+        try:
+            spon_obj = SponsorProfile.objects.get(id=sponid)
+        except SponsorProfile.DoesNotExist:
+            return None, Response({"error": "Invalid sponsor ID"}, status=status.HTTP_404_NOT_FOUND)
+
+    dep_id = report_data.get("dep")
+    dep_obj = None
+    if dep_id:
+        try:
+            dep_obj = VerimedDepartment.objects.get(id=dep_id)
+        except VerimedDepartment.DoesNotExist:
+            return None, Response({"error": "Invalid department ID"}, status=status.HTTP_404_NOT_FOUND)
+
+    doc_id = report_data.get("doc")
+    doc_obj = None
+    if doc_id:
+        try:
+            doc_obj = DoctorProfile.objects.get(id=doc_id)
+        except DoctorProfile.DoesNotExist:
+            return None, Response({"error": "Invalid doctor ID"}, status=status.HTTP_404_NOT_FOUND)
+
+    caretaker_id = report_data.get("caretaker")
+    caretaker_obj = None
+    if caretaker_id:
+        try:
+            caretaker_obj = CareTakerProfile.objects.get(id=caretaker_id)
+        except CareTakerProfile.DoesNotExist:
+            return None, Response({"error": "Invalid caretaker ID"}, status=status.HTTP_404_NOT_FOUND)
+
+    patient_id = report_data.get("patient")
+    patient_obj = None
+    if patient_id:
+        try:
+            patient_obj = PatientProfile.objects.get(id=patient_id)
+        except PatientProfile.DoesNotExist:
+            return None, Response({"error": "Invalid patient ID"}, status=status.HTTP_404_NOT_FOUND)
+
+    if spon_obj is None and patient_obj is not None and patient_obj.sponsor is not None:
+        spon_obj = patient_obj.sponsor
+
+    if is_sponsor_user(request.user):
+        logged_sponsor = get_sponsor_profile(request.user)
+        if logged_sponsor is None:
+            return None, Response({"error": "Sponsor profile not found"}, status=status.HTTP_403_FORBIDDEN)
+        if spon_obj is not None and spon_obj.id != logged_sponsor.id:
+            return None, Response(
+                {"error": "You can only create appointments for your own sponsor account."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        spon_obj = logged_sponsor
+        if patient_obj is not None and patient_obj.sponsor_id != logged_sponsor.id:
+            return None, Response(
+                {"error": "You can only book appointments for your own loved ones/patients."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+    resolved = {
+        "report_data": report_data,
+        "spon_obj": spon_obj,
+        "dep_obj": dep_obj,
+        "doc_obj": doc_obj,
+        "caretaker_obj": caretaker_obj,
+        "patient_obj": patient_obj,
+        "lab_report_files": request.FILES.getlist("lab_reports"),
+    }
+    return resolved, None
+
+
+def _create_appointment_record(resolved, appointment_status_value="Pending", service_purchased_value=False, amount_override=None):
+    report_data = resolved["report_data"]
+    spon_obj = resolved["spon_obj"]
+    dep_obj = resolved["dep_obj"]
+    doc_obj = resolved["doc_obj"]
+    caretaker_obj = resolved["caretaker_obj"]
+    patient_obj = resolved["patient_obj"]
+    lab_report_files = resolved["lab_report_files"]
+
+    with transaction.atomic():
+        appointment = VerimedBookAppointment.objects.create(
+            sponsor=spon_obj,
+            dep=dep_obj,
+            doc=doc_obj,
+            patient=patient_obj,
+            caretaker=caretaker_obj,
+            appointment_date=report_data.get("appointment_date"),
+            appointment_time=report_data.get("appointment_time"),
+            appointment_type=report_data.get("appointment_type"),
+            treatment_performed=report_data.get("treatment_performed"),
+            care_taker_notes=report_data.get("care_taker_notes"),
+            amount=amount_override if amount_override is not None else report_data.get("amount"),
+            subscription_plan=report_data.get("subscription_plan"),
+            height=report_data.get("height"),
+            weight=report_data.get("weight"),
+            blood_pressure=report_data.get("blood_pressure"),
+            blood_sugar=report_data.get("blood_sugar"),
+            medical_history=report_data.get("medical_history"),
+            appointment_history=report_data.get("appointment_history"),
+            time_line=report_data.get("time_line"),
+            appointment_reason=report_data.get("appointment_reason"),
+            appointment_status=appointment_status_value,
+            preferred_dates=report_data.get("preferred_dates"),
+            preferred_times=report_data.get("preferred_times"),
+            service_purchased=service_purchased_value,
+        )
+
+        if lab_report_files:
+            for file_obj in lab_report_files:
+                VerimedBookAppointmentLabReports.objects.create(
+                    appointment=appointment,
+                    file=file_obj,
+                    patient=patient_obj,
+                    referid=appointment.id
+                )
+
+    return appointment
+
+
+def _resolve_frontend_appointments_url(request):
+    from django.conf import settings
+    from urllib.parse import urlparse
+
+    default_base = (
+        getattr(settings, "FRONTEND_DASHBOARD_URL", "https://verimed-fe.vercel.app/")
+        or "https://verimed-fe.vercel.app/"
+    ).rstrip("/")
+    raw_origin = str(request.data.get("frontend_origin") or "").strip().rstrip("/")
+    raw_return_path = str(request.data.get("return_path") or "/appointments").strip() or "/appointments"
+    if not raw_return_path.startswith("/"):
+        raw_return_path = f"/{raw_return_path}"
+
+    allowed_hosts = {
+        "verimed-fe.vercel.app",
+        "verimed.care",
+        "portal.verimed.care",
+        "localhost",
+        "127.0.0.1",
+    }
+    chosen_base = default_base
+    if raw_origin:
+        parsed = urlparse(raw_origin)
+        hostname = (parsed.hostname or "").lower()
+        if parsed.scheme in ("http", "https") and (
+            hostname in allowed_hosts or hostname.endswith(".vercel.app")
+        ):
+            chosen_base = f"{parsed.scheme}://{parsed.netloc}"
+    return f"{chosen_base}{raw_return_path}"
+
+
+def _session_field(session_obj, key, default=None):
+    if session_obj is None:
+        return default
+    if isinstance(session_obj, dict):
+        return session_obj.get(key, default)
+    return getattr(session_obj, key, default)
+
+
+def _finalize_paid_appointment_draft(draft_id, session_obj=None):
+    with transaction.atomic():
+        updated_count = VerimedBookAppointment.objects.filter(
+            id=draft_id,
+            appointment_status=APPOINTMENT_PENDING_PAYMENT_STATUS,
+        ).update(
+            appointment_status="Pending",
+            service_purchased=True,
+        )
+        appointment = VerimedBookAppointment.objects.select_related(
+            "sponsor__user", "patient__sponsor__user"
+        ).get(id=draft_id)
+
+        if session_obj is not None:
+            payment_ref = _session_field(session_obj, "payment_intent") or _session_field(session_obj, "id")
+            if payment_ref:
+                customer_details = _session_field(session_obj, "customer_details") or {}
+                cust_email = (
+                    (_session_field(customer_details, "email") or "").strip()
+                    or (_session_field(session_obj, "customer_email") or "").strip()
+                    or (
+                        getattr(
+                            getattr(appointment.sponsor or getattr(appointment.patient, "sponsor", None), "user", None),
+                            "email",
+                            None,
+                        )
+                        or ""
+                    ).strip()
+                    or "noreply@verimed.care"
+                )
+                amount_total = int(_session_field(session_obj, "amount_total") or 0)
+                Order.objects.get_or_create(
+                    payment_intent=str(payment_ref),
+                    defaults={
+                        "email": cust_email,
+                        "amount": amount_total,
+                        "status": "paid",
+                    },
+                )
+
+    if updated_count == 1:
+        email_sent, email_error = _send_appointment_request_email(appointment)
+        return appointment, True, email_sent, email_error
+
+    return appointment, False, True, None
+
+
 class VerimedBookAppoinmentCreateUpdate(APIView):
     authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated]
     
     def post(self, request):
-        # Step 1: Parse JSON data
-        raw_data = request.data.get("bookappoinment_data")
-        if not raw_data:
-            return Response({"error": "bookappoinment_data is mandatory"}, status=status.HTTP_400_BAD_REQUEST)
+        resolved, error_response = _validate_and_resolve_appointment_request(request)
+        if error_response is not None:
+            return error_response
 
-        if isinstance(raw_data, str):
-            try:
-                report_data = json.loads(raw_data)
-            except json.JSONDecodeError:
-                return Response({"error": "Invalid JSON format"}, status=status.HTTP_400_BAD_REQUEST)
-        elif isinstance(raw_data, dict):
-            report_data = raw_data
-        else:
+        report_data = resolved["report_data"]
+        spon_obj = resolved["spon_obj"]
+        dep_obj = resolved["dep_obj"]
+        requested_service_name = report_data.get("appointment_type") or getattr(dep_obj, "dep_name", None)
+        is_prepaid, matched_plan = _user_has_prepaid_service(
+            request.user,
+            spon_obj,
+            service_name=requested_service_name,
+            dep_obj=dep_obj,
+        )
+
+        if not is_prepaid:
             return Response(
-                {"error": "Invalid data type. Expected JSON string or dict."},
-                status=status.HTTP_400_BAD_REQUEST
+                {
+                    "error": "Stripe payment completion is required before creating this appointment request and sending confirmation email.",
+                    "payment_required": True,
+                },
+                status=status.HTTP_402_PAYMENT_REQUIRED,
             )
 
-        # Step 2: Validate Foreign Keys
-        sponid=report_data.get("sponsor")
-        spon_obj=None
-        if sponid:
-            try:
-                spon_obj = SponsorProfile.objects.get(id=sponid)
-            except SponsorProfile.DoesNotExist:
-                return Response({"error": "Invalid sponsor ID"}, status=status.HTTP_404_NOT_FOUND)
-
-        
-        dep_id = report_data.get("dep")
-        dep_obj = None
-        if dep_id:
-            try:
-                dep_obj = VerimedDepartment.objects.get(id=dep_id)
-            except VerimedDepartment.DoesNotExist:
-                return Response({"error": "Invalid department ID"}, status=status.HTTP_404_NOT_FOUND)
-
-        doc_id = report_data.get("doc")
-        doc_obj = None
-        if doc_id:
-            try:
-                doc_obj = DoctorProfile.objects.get(id=doc_id)
-            except DoctorProfile.DoesNotExist:
-                return Response({"error": "Invalid doctor ID"}, status=status.HTTP_404_NOT_FOUND)
-
-        caretaker_id = report_data.get("caretaker")
-        caretaker_obj = None
-        if caretaker_id:
-            try:
-                caretaker_obj = CareTakerProfile.objects.get(id=caretaker_id)
-            except CareTakerProfile.DoesNotExist:
-                return Response({"error": "Invalid caretaker ID"}, status=status.HTTP_404_NOT_FOUND)
-
-        patient_id = report_data.get("patient")
-        patient_obj = None
-        if patient_id:
-            try:
-                patient_obj = PatientProfile.objects.get(id=patient_id)
-            except PatientProfile.DoesNotExist:
-                return Response({"error": "Invalid patient ID"}, status=status.HTTP_404_NOT_FOUND)
-
-        if is_sponsor_user(request.user):
-            logged_sponsor = get_sponsor_profile(request.user)
-            if logged_sponsor is None:
-                return Response({"error": "Sponsor profile not found"}, status=status.HTTP_403_FORBIDDEN)
-            if spon_obj is not None and spon_obj.id != logged_sponsor.id:
-                return Response(
-                    {"error": "You can only create appointments for your own sponsor account."},
-                    status=status.HTTP_403_FORBIDDEN
-                )
-            spon_obj = logged_sponsor
-            if patient_obj is not None and patient_obj.sponsor_id != logged_sponsor.id:
-                return Response(
-                    {"error": "You can only book appointments for your own loved ones/patients."},
-                    status=status.HTTP_403_FORBIDDEN
-                )
-
-        # Step 3: Get uploaded files (multiple)
-        lab_report_files = request.FILES.getlist("lab_reports")
-
-        # Step 4: Transaction block to ensure atomic save
         try:
-            with transaction.atomic():
-                appointment = VerimedBookAppointment.objects.create(
-                    sponsor=spon_obj,
-                    dep=dep_obj,
-                    doc=doc_obj,
-                    patient=patient_obj,
-                    caretaker=caretaker_obj,
-                    appointment_date=report_data.get("appointment_date"),
-                    appointment_time=report_data.get("appointment_time"),
-                    appointment_type=report_data.get("appointment_type"),
-                    treatment_performed=report_data.get("treatment_performed"),
-                    care_taker_notes=report_data.get("care_taker_notes"),
-                    amount=report_data.get("amount"),
-                    subscription_plan=report_data.get("subscription_plan"),
-                    height=report_data.get("height"),
-                    weight=report_data.get("weight"),
-                    blood_pressure=report_data.get("blood_pressure"),
-                    blood_sugar=report_data.get("blood_sugar"),
-                    medical_history=report_data.get("medical_history"),
-                    appointment_history=report_data.get("appointment_history"),
-                    time_line=report_data.get("time_line"),
-                    appointment_reason=report_data.get("appointment_reason"),
-                    appointment_status=report_data.get("appointment_status", "Pending"),
-                    preferred_dates=report_data.get("preferred_dates"),
-                    preferred_times=report_data.get("preferred_times"),
-                    service_purchased=(
-                        False
-                        if report_data.get("service_purchased") is None
-                        else report_data.get("service_purchased")
-                    ),
-                    
-                )
-
-                # Step 5: Save multiple lab reports
-                if lab_report_files:
-                    for file_obj in lab_report_files:
-                        VerimedBookAppointmentLabReports.objects.create(
-                            appointment=appointment,
-                            file=file_obj,
-                            patient=patient_obj,
-                            referid=appointment.id
-                        )
-
-            from html import escape as html_escape
-            from django.core.mail import EmailMessage
-            from django.conf import settings
-
-            effective_sponsor = (
-                appointment.sponsor
-                or spon_obj
-                or getattr(appointment.patient, "sponsor", None)
+            target_status = report_data.get("appointment_status") or "Pending"
+            if target_status == APPOINTMENT_PENDING_PAYMENT_STATUS:
+                target_status = "Pending"
+            appointment = _create_appointment_record(
+                resolved,
+                appointment_status_value=target_status,
+                service_purchased_value=True,
             )
-            sponsor_user = getattr(effective_sponsor, "user", None)
-            sponsoremail = (getattr(sponsor_user, "email", None) or "").strip()
-            sponsorname = (
-                (getattr(sponsor_user, "first_name", None) or "").strip()
-                or (getattr(sponsor_user, "username", None) or "").strip()
-                or "Valued Family Member"
-            )
-
-            def send_api_verticalcontact_mail(sponsorname, sponsoremail):
-                if not sponsoremail:
-                    return False, "Sponsor email address is missing."
-
-                subject = "Thank You — Your Appointment Request Is Being Processed"
-                message = f"""
-                    <p>Hello <strong>{html_escape(sponsorname)}</strong>,</p>
-
-                    <p>
-                        Thank you for scheduling with VeriMED, the trusted in-home and virtual care
-                        program for Cameroon’s global families.
-                    </p>
-
-                    <p>
-                        Your appointment request has been received. Our care coordination team is
-                        reviewing your preferred date and time. You will receive a formal
-                        confirmation shortly.
-                    </p>
-
-                    <p>
-                        Thank you for choosing a service designed to give aging parents premium care —
-                        and families abroad peace of mind.
-                    </p>
-
-                    <p>
-                        With gratitude,<br>
-                        <strong>The VeriMED Clinical & Care Coordination Team</strong><br>
-                        Physician-Led. Nurse-Powered. Cameroon’s Trusted Home Health Service.<br>
-                        Global-Standard Medical Care for Loved Ones Back Home.
-                    </p>
-
-                    <p>www.Verimed.care ~~~ Serving Families Worldwide</p>
-                    """
-
-                from_email = settings.DEFAULT_FROM_EMAIL
-                recipient_list = [sponsoremail]
-
-                try:
-                    email_msg = EmailMessage(subject, "", from_email, recipient_list)
-                    email_msg.content_subtype = "html"  # VERY IMPORTANT
-                    email_msg.body = message
-                    email_msg.send(fail_silently=False)
-                    print("Vertical contact email sent successfully")
-                    return True, None
-                except Exception as e:
-                    print(f"Appoinment Booking Post sending vertical contact email: {e}")
-                    return False, str(e)
-
-            email_sent, email_error = send_api_verticalcontact_mail(sponsorname, sponsoremail)
+            email_sent, email_error = _send_appointment_request_email(appointment)
 
             return Response(
                 {
                     "message": "Patient appointment booked successfully",
+                    "appointment_id": appointment.id,
+                    "covered_plan": matched_plan,
                     "email_sent": email_sent,
                     **({"email_error": email_error} if email_error else {}),
                 },
@@ -1816,6 +2054,12 @@ class VerimedBookAppoinmentCreateUpdate(APIView):
             appointmentobj = VerimedBookAppointment.objects.get(id=appointment_id)
         except VerimedBookAppointment.DoesNotExist:
             return Response({"error": "Invalid update_appoinmentid"}, status=status.HTTP_404_NOT_FOUND)
+
+        if appointmentobj.appointment_status == APPOINTMENT_PENDING_PAYMENT_STATUS:
+            return Response(
+                {"error": "Cannot update an unpaid appointment draft before Stripe payment is completed."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         if is_sponsor_user(request.user):
             logged_sponsor = get_sponsor_profile(request.user)
@@ -2157,7 +2401,7 @@ class VerimedBookAppoinmentCreateUpdate(APIView):
 
     def get(self, request):
         try:
-            appointments_qs = VerimedBookAppointment.objects.all()
+            appointments_qs = _exclude_unpaid_appointment_drafts(VerimedBookAppointment.objects.all())
 
             if is_sponsor_user(request.user):
                 sponsor_profile = get_sponsor_profile(request.user)
@@ -2295,14 +2539,16 @@ class VB_PatientAppoinment_List(APIView):
                     if sponsor_profile is None:
                         return Response([], status=status.HTTP_200_OK)
                     appointments_qs = filter_queryset_by_sponsor(
-                        VerimedBookAppointment.objects.all(), sponsor_profile
+                        _exclude_unpaid_appointment_drafts(VerimedBookAppointment.objects.all()), sponsor_profile
                     )
                     if patientprofileid:
                         appointments_qs = appointments_qs.filter(patient_id=patientprofileid)
                     appointments_qs = appointments_qs.order_by('-id')
                 else:
                     if patientprofileid:
-                        appointments_qs = VerimedBookAppointment.objects.filter(patient_id=patientprofileid)
+                        appointments_qs = _exclude_unpaid_appointment_drafts(
+                            VerimedBookAppointment.objects.filter(patient_id=patientprofileid)
+                        )
                         if sponsorid:
                             sponsor_obj = resolve_sponsor_profile_by_param(sponsorid)
                             if sponsor_obj is None:
@@ -2314,7 +2560,7 @@ class VB_PatientAppoinment_List(APIView):
                         if sponsor_obj is None:
                             return Response([], status=status.HTTP_200_OK)
                         appointments_qs = filter_queryset_by_sponsor(
-                            VerimedBookAppointment.objects.all(), sponsor_obj
+                            _exclude_unpaid_appointment_drafts(VerimedBookAppointment.objects.all()), sponsor_obj
                         ).order_by('-id')
                     else:
                         appointments_qs = VerimedBookAppointment.objects.none()
@@ -2362,7 +2608,9 @@ class VB_DoctorAppoinment_List(APIView):
     def post(self,request):
         doctorprofileid=request.data.get("doctorprofileid")
         try:
-                appointments_qs = VerimedBookAppointment.objects.filter(doc_id=doctorprofileid)
+                appointments_qs = _exclude_unpaid_appointment_drafts(
+                    VerimedBookAppointment.objects.filter(doc_id=doctorprofileid)
+                )
                 if is_sponsor_user(request.user):
                     sponsor_profile = get_sponsor_profile(request.user)
                     if sponsor_profile is None:
@@ -2442,7 +2690,7 @@ class VB_SponsorAppoinment_List(APIView):
                     )
 
             appointments_qs = filter_queryset_by_sponsor(
-                VerimedBookAppointment.objects.all(), sponsor_obj
+                _exclude_unpaid_appointment_drafts(VerimedBookAppointment.objects.all()), sponsor_obj
             )
             if patientprofileid:
                 appointments_qs = appointments_qs.filter(patient_id=patientprofileid)
@@ -4423,16 +4671,27 @@ class KetnyproductionCheckRD(APIView):
        
         
 # paymentimport stripe
-import stripe
+try:
+    import stripe
+except ImportError:
+    stripe = None
 import json
+from decimal import Decimal
 from django.conf import settings
 from django.shortcuts import render, redirect
 from django.http import HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 from .models import Order
 
-# IMPORTANT: use SECRET KEY
-stripe.api_key = settings.STRIPE_SECRET_KEY
+
+def _configure_stripe():
+    secret_key = (getattr(settings, "STRIPE_SECRET_KEY", "") or "").strip()
+    if stripe is None:
+        return None, "Stripe SDK is not installed on the server."
+    if not secret_key or secret_key == "sk_test_placeholder":
+        return None, "Stripe is not configured on the server. Please set STRIPE_SECRET_KEY in environment variables."
+    stripe.api_key = secret_key
+    return secret_key, None
 
 
 def payment_page(request):
@@ -4440,6 +4699,10 @@ def payment_page(request):
 
 
 def create_checkout_session(request):
+    _, stripe_err = _configure_stripe()
+    if stripe_err:
+        return HttpResponse(stripe_err, status=503)
+
     backend_base_url = getattr(
         settings, "FRONTEND_URL", "https://verimed-be.vercel.app"
     ).rstrip("/")
@@ -4467,6 +4730,278 @@ def create_checkout_session(request):
     return redirect(session.url, permanent=False)
 
 
+class CreateAppointmentCheckoutSession(APIView):
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        resolved, error_response = _validate_and_resolve_appointment_request(request)
+        if error_response is not None:
+            return error_response
+
+        report_data = resolved["report_data"]
+        spon_obj = resolved["spon_obj"]
+        dep_obj = resolved["dep_obj"]
+        requested_service_name = report_data.get("appointment_type") or getattr(dep_obj, "dep_name", None)
+
+        # If the sponsor/user already owns this exact active plan, create & email directly
+        is_prepaid, matched_plan = _user_has_prepaid_service(
+            request.user,
+            spon_obj,
+            service_name=requested_service_name,
+            dep_obj=dep_obj,
+        )
+        if is_prepaid:
+            try:
+                target_status = report_data.get("appointment_status") or "Pending"
+                if target_status == APPOINTMENT_PENDING_PAYMENT_STATUS:
+                    target_status = "Pending"
+                appointment = _create_appointment_record(
+                    resolved,
+                    appointment_status_value=target_status,
+                    service_purchased_value=True,
+                )
+                email_sent, email_error = _send_appointment_request_email(appointment)
+                return Response(
+                    {
+                        "payment_required": False,
+                        "created": True,
+                        "appointment_id": appointment.id,
+                        "covered_plan": matched_plan,
+                        "message": "Patient appointment booked successfully",
+                        "email_sent": email_sent,
+                        **({"email_error": email_error} if email_error else {}),
+                    },
+                    status=status.HTTP_200_OK,
+                )
+            except Exception as e:
+                return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        # Otherwise require Stripe Checkout BEFORE finalizing/emailing the appointment
+        _, stripe_err = _configure_stripe()
+        if stripe_err:
+            return Response({"error": stripe_err}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        unit_amount_cents, canonical_service_name = _resolve_appointment_service_pricing(
+            appointment_type=report_data.get("appointment_type"),
+            dep_obj=dep_obj,
+            raw_amount=report_data.get("amount"),
+        )
+        if not unit_amount_cents or unit_amount_cents <= 0:
+            return Response(
+                {"error": "A valid billable service fee is required to initiate Stripe Checkout."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        appointments_url = _resolve_frontend_appointments_url(request)
+        effective_sponsor_user = getattr(spon_obj, "user", None)
+        customer_email = (
+            (getattr(effective_sponsor_user, "email", None) or "").strip()
+            or (getattr(request.user, "email", None) or "").strip()
+            or None
+        )
+
+        draft = None
+        try:
+            draft_amount = Decimal(unit_amount_cents) / Decimal("100")
+            draft = _create_appointment_record(
+                resolved,
+                appointment_status_value=APPOINTMENT_PENDING_PAYMENT_STATUS,
+                service_purchased_value=False,
+                amount_override=draft_amount,
+            )
+
+            checkout_kwargs = {
+                "mode": "payment",
+                "payment_method_types": ["card"],
+                "line_items": [
+                    {
+                        "price_data": {
+                            "currency": "usd",
+                            "unit_amount": int(unit_amount_cents),
+                            "product_data": {
+                                "name": canonical_service_name,
+                            },
+                        },
+                        "quantity": 1,
+                    }
+                ],
+                "client_reference_id": str(draft.id),
+                "metadata": {
+                    "appointment_draft_id": str(draft.id),
+                    "requested_by_user_id": str(request.user.id),
+                    "service_name": canonical_service_name[:120],
+                },
+                "success_url": f"{appointments_url}?stripe_payment=success&session_id={{CHECKOUT_SESSION_ID}}&draft_id={draft.id}",
+                "cancel_url": f"{appointments_url}?stripe_payment=cancelled&draft_id={draft.id}",
+            }
+            if customer_email:
+                checkout_kwargs["customer_email"] = customer_email
+
+            session = stripe.checkout.Session.create(**checkout_kwargs)
+            return Response(
+                {
+                    "payment_required": True,
+                    "checkout_url": _session_field(session, "url"),
+                    "session_id": _session_field(session, "id"),
+                    "draft_id": draft.id,
+                },
+                status=status.HTTP_200_OK,
+            )
+        except Exception as e:
+            if draft is not None:
+                try:
+                    with transaction.atomic():
+                        VerimedBookAppointmentLabReports.objects.filter(
+                            Q(appointment=draft) | Q(referid=str(draft.id))
+                        ).delete()
+                        draft.delete()
+                except Exception:
+                    pass
+            return Response(
+                {"error": f"Unable to create Stripe Checkout session: {str(e)}"},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+
+class VerifyAppointmentCheckoutSession(APIView):
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        session_id = (request.data.get("session_id") or "").strip()
+        requested_draft_id = request.data.get("draft_id")
+
+        if not session_id:
+            return Response({"error": "session_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        _, stripe_err = _configure_stripe()
+        if stripe_err:
+            return Response({"error": stripe_err}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        try:
+            session = stripe.checkout.Session.retrieve(session_id)
+        except Exception as e:
+            return Response(
+                {"error": f"Failed to verify Stripe Checkout session: {str(e)}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        payment_status = (_session_field(session, "payment_status") or "").lower()
+        metadata = _session_field(session, "metadata") or {}
+        meta_draft_id = _session_field(metadata, "appointment_draft_id") or _session_field(
+            session, "client_reference_id"
+        )
+
+        if requested_draft_id and meta_draft_id and str(requested_draft_id) != str(meta_draft_id):
+            return Response(
+                {"error": "Stripe session does not match the specified appointment draft."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        resolved_draft_id = meta_draft_id or requested_draft_id
+        if not resolved_draft_id or not str(resolved_draft_id).isdigit():
+            return Response(
+                {"error": "Missing or invalid appointment draft reference on Stripe session."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        draft_pk = int(resolved_draft_id)
+
+        try:
+            draft_obj = VerimedBookAppointment.objects.select_related("patient").get(id=draft_pk)
+        except VerimedBookAppointment.DoesNotExist:
+            return Response(
+                {"error": "Appointment draft was not found or was cancelled."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if is_sponsor_user(request.user):
+            logged_sponsor = get_sponsor_profile(request.user)
+            owns_draft = logged_sponsor is not None and (
+                draft_obj.sponsor_id == logged_sponsor.id
+                or (draft_obj.patient is not None and draft_obj.patient.sponsor_id == logged_sponsor.id)
+            )
+            if not owns_draft:
+                return Response(
+                    {"error": "You do not have permission to verify another sponsor's appointment payment."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+        if payment_status != "paid":
+            return Response(
+                {
+                    "paid": False,
+                    "payment_status": payment_status or "unpaid",
+                    "error": "Stripe payment is not completed yet. Appointment was not created.",
+                },
+                status=status.HTTP_402_PAYMENT_REQUIRED,
+            )
+
+        appointment, transitioned, email_sent, email_error = _finalize_paid_appointment_draft(
+            draft_pk, session_obj=session
+        )
+
+        return Response(
+            {
+                "paid": True,
+                "created": transitioned,
+                "already_finalized": not transitioned,
+                "appointment_id": appointment.id,
+                "appointment_status": appointment.appointment_status,
+                "email_sent": email_sent,
+                **({"email_error": email_error} if email_error else {}),
+                "message": (
+                    "Payment verified and appointment request sent!"
+                    if email_sent
+                    else "Payment verified and appointment requested, but sponsor email could not be sent."
+                ),
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class CancelAppointmentCheckoutSession(APIView):
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        draft_id = request.data.get("draft_id")
+        if not draft_id or not str(draft_id).isdigit():
+            return Response({"error": "Valid draft_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        draft_pk = int(draft_id)
+        try:
+            draft_obj = VerimedBookAppointment.objects.select_related("patient").get(id=draft_pk)
+        except VerimedBookAppointment.DoesNotExist:
+            return Response({"cancelled": True, "deleted": False}, status=status.HTTP_200_OK)
+
+        if is_sponsor_user(request.user):
+            logged_sponsor = get_sponsor_profile(request.user)
+            owns_draft = logged_sponsor is not None and (
+                draft_obj.sponsor_id == logged_sponsor.id
+                or (draft_obj.patient is not None and draft_obj.patient.sponsor_id == logged_sponsor.id)
+            )
+            if not owns_draft:
+                return Response(
+                    {"error": "You do not have permission to cancel another sponsor's draft."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+        if draft_obj.appointment_status != APPOINTMENT_PENDING_PAYMENT_STATUS:
+            return Response(
+                {"cancelled": False, "already_paid": True, "appointment_id": draft_obj.id},
+                status=status.HTTP_200_OK,
+            )
+
+        with transaction.atomic():
+            VerimedBookAppointmentLabReports.objects.filter(
+                Q(appointment=draft_obj) | Q(referid=str(draft_obj.id))
+            ).delete()
+            draft_obj.delete()
+
+        return Response({"cancelled": True, "deleted": True}, status=status.HTTP_200_OK)
+
+
 def success(request):
     return render(request, "success.html")
 
@@ -4477,10 +5012,15 @@ def cancel(request):
 
 @csrf_exempt
 def stripe_webhook(request):
+    if stripe is None:
+        return HttpResponse(status=503)
 
     payload = request.body
     sig_header = request.META.get("HTTP_STRIPE_SIGNATURE")
-    endpoint_secret = settings.STRIPE_WEBHOOK_SECRET
+    endpoint_secret = getattr(settings, "STRIPE_WEBHOOK_SECRET", "")
+    sig_error_cls = getattr(stripe, "SignatureVerificationError", None) or getattr(
+        getattr(stripe, "error", None), "SignatureVerificationError", Exception
+    )
 
     try:
         event = stripe.Webhook.construct_event(
@@ -4491,7 +5031,7 @@ def stripe_webhook(request):
         # Invalid payload
         return HttpResponse(status=400)
 
-    except stripe.error.SignatureVerificationError:
+    except sig_error_cls:
         # Invalid signature
         return HttpResponse(status=400)
 
@@ -4499,17 +5039,27 @@ def stripe_webhook(request):
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
 
-        payment_intent = session.get("payment_intent")
-        email = session.get("customer_details", {}).get("email")
-        amount = session.get("amount_total")
+        payment_intent = session.get("payment_intent") or session.get("id")
+        email = (session.get("customer_details") or {}).get("email") or session.get("customer_email") or "noreply@verimed.care"
+        amount = session.get("amount_total") or 0
 
-        Order.objects.get_or_create(
-            payment_intent=payment_intent,
-            defaults={
-                "email": email,
-                "amount": amount,
-                "status": "paid",
-            },
-        )
+        if payment_intent:
+            Order.objects.get_or_create(
+                payment_intent=payment_intent,
+                defaults={
+                    "email": email,
+                    "amount": amount,
+                    "status": "paid",
+                },
+            )
+
+        payment_status = (session.get("payment_status") or "").lower()
+        metadata = session.get("metadata") or {}
+        draft_ref = metadata.get("appointment_draft_id") or session.get("client_reference_id")
+        if payment_status == "paid" and draft_ref and str(draft_ref).isdigit():
+            try:
+                _finalize_paid_appointment_draft(int(draft_ref), session_obj=session)
+            except VerimedBookAppointment.DoesNotExist:
+                pass
 
     return HttpResponse(status=200)
