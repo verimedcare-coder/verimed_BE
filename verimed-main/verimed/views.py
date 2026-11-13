@@ -4709,7 +4709,6 @@ def create_checkout_session(request):
 
     session = stripe.checkout.Session.create(
         mode="payment",
-        payment_method_types=["card"],
         line_items=[
             {
                 "price_data": {
@@ -4813,7 +4812,6 @@ class CreateAppointmentCheckoutSession(APIView):
 
             checkout_kwargs = {
                 "mode": "payment",
-                "payment_method_types": ["card"],
                 "line_items": [
                     {
                         "price_data": {
