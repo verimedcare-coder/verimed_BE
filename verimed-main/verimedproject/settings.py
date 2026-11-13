@@ -194,8 +194,22 @@ DATABASES = {
 # }
 
 
+import tempfile
+
 MEDIA_URL = '/media/'
-MEDIA_ROOT = BASE_DIR / 'media'
+
+# On Vercel / serverless deployments, BASE_DIR (/var/task) is mounted read-only.
+# Automatically use /tmp/media if running on Vercel or if BASE_DIR is read-only.
+_default_media_root = (
+    Path(tempfile.gettempdir()) / "media"
+    if (os.environ.get("VERCEL") or not os.access(BASE_DIR, os.W_OK))
+    else BASE_DIR / "media"
+)
+MEDIA_ROOT = Path(os.environ.get("MEDIA_ROOT", str(_default_media_root)))
+try:
+    os.makedirs(MEDIA_ROOT, exist_ok=True)
+except Exception:
+    pass
 
 
 # Password validation

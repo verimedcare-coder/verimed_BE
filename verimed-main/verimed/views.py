@@ -1153,16 +1153,24 @@ class UserUpdate(APIView):
                 # user.role = user_update_data.get("role", user.role)
 
                 # Update photo if provided
-                photo = request.data.get("photo")   
-                if photo:
+                photo = request.data.get("photo") or request.FILES.get("photo") or request.FILES.get("user_photo")
+                if photo and hasattr(photo, "read"):
                     user.photo = photo
+                elif photo and isinstance(photo, str) and photo.strip() not in ("", "null", "undefined", "[]"):
+                    if not photo.startswith(("data:", "blob:")):
+                        user.photo = photo
 
                 # Update password if provided
                 password = user_update_data.get("password")
                 if password:
                     user.password = make_password(password)
 
-                user.save()
+                try:
+                    user.save()
+                except OSError as os_err:
+                    print(f"Filesystem error during user.save with photo: {os_err}")
+                    user.photo = None
+                    user.save()
                 code = user.country_code.code if user and user.country_code else None
                 
                 return Response({
@@ -1247,16 +1255,24 @@ class UserUpdateUser(APIView):
                 user.is_active_state = user_update_data.get("is_active_state", user.is_active_state)
 
                 # Update photo if provided
-                photo = request.data.get("photo")   
-                if photo:
+                photo = request.data.get("photo") or request.FILES.get("photo") or request.FILES.get("user_photo")
+                if photo and hasattr(photo, "read"):
                     user.photo = photo
+                elif photo and isinstance(photo, str) and photo.strip() not in ("", "null", "undefined", "[]"):
+                    if not photo.startswith(("data:", "blob:")):
+                        user.photo = photo
 
                 # Update password if provided
                 password = user_update_data.get("password")
                 if password:
                     user.password = make_password(password)
 
-                user.save()
+                try:
+                    user.save()
+                except OSError as os_err:
+                    print(f"Filesystem error during user.save with photo: {os_err}")
+                    user.photo = None
+                    user.save()
 
                 from django.core.mail import EmailMessage
                 from django.conf import settings
@@ -3356,7 +3372,12 @@ class PatientProfileCreateUpdate(APIView):
                 patient_updateobj.goals_special_instructions = data.get("goals_special_instructions", patient_updateobj.goals_special_instructions)
                 patient_updateobj.goals_term_membership = data.get("goals_term_membership", patient_updateobj.goals_term_membership)
                 
-                patient_updateobj.save()
+                try:
+                    patient_updateobj.save()
+                except OSError as os_err:
+                    print(f"Filesystem error during patient_updateobj.save: {os_err}")
+                    patient_updateobj.photo = None
+                    patient_updateobj.save()
                 
                 if upload_files:
                     for index, file_obj in enumerate(upload_files):
